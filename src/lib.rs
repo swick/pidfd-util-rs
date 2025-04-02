@@ -7,13 +7,13 @@ use async_io::Async;
 use std::{io, process::ExitStatus};
 
 mod lowlevel {
+    use nix::ioctl_readwrite;
     use std::io;
     use std::os::fd::{FromRawFd, OwnedFd, RawFd};
     #[cfg(not(feature = "nightly"))]
     use std::os::unix::process::ExitStatusExt;
     #[cfg(not(feature = "nightly"))]
     use std::process::ExitStatus;
-    use nix::ioctl_readwrite;
 
     trait IsMinusOne {
         fn is_minus_one(&self) -> bool;
@@ -39,14 +39,14 @@ mod lowlevel {
 
     fn ioctl_unsupported(e: nix::Error) -> nix::Error {
         match e {
-            nix::Error::EOPNOTSUPP |
-            nix::Error::ENOTTY |
-            nix::Error::ENOSYS |
-            nix::Error::EAFNOSUPPORT |
-            nix::Error::EPFNOSUPPORT |
-            nix::Error::EPROTONOSUPPORT |
-            nix::Error::ESOCKTNOSUPPORT |
-            nix::Error::ENOPROTOOPT => nix::Error::EOPNOTSUPP,
+            nix::Error::EOPNOTSUPP
+            | nix::Error::ENOTTY
+            | nix::Error::ENOSYS
+            | nix::Error::EAFNOSUPPORT
+            | nix::Error::EPFNOSUPPORT
+            | nix::Error::EPROTONOSUPPORT
+            | nix::Error::ESOCKTNOSUPPORT
+            | nix::Error::ENOPROTOOPT => nix::Error::EOPNOTSUPP,
             e => e,
         }
     }
@@ -55,7 +55,7 @@ mod lowlevel {
     const PIDFS_IOCTL_GET_INFO: u8 = 11;
 
     #[non_exhaustive]
-    struct PidfdInfoFlags(u64);
+    struct PidfdInfoFlags;
 
     impl PidfdInfoFlags {
         /* Always returned, even if not requested */
@@ -90,9 +90,14 @@ mod lowlevel {
         exit_code: i32,
     }
 
-    ioctl_readwrite!(pidfd_get_info_ioctl, PIDFS_IOCTL_MAGIC, PIDFS_IOCTL_GET_INFO, PidfdInfo);
+    ioctl_readwrite!(
+        pidfd_get_info_ioctl,
+        PIDFS_IOCTL_MAGIC,
+        PIDFS_IOCTL_GET_INFO,
+        PidfdInfo
+    );
 
-    fn pidfd_get_info(pidfd: RawFd, flags: PidfdInfoFlags) -> Result<PidfdInfo, nix::Error> {
+    fn pidfd_get_info(pidfd: RawFd, flags: u64) -> Result<PidfdInfo, nix::Error> {
         use std::sync::atomic::AtomicU8;
         use std::sync::atomic::Ordering;
 
@@ -109,7 +114,7 @@ mod lowlevel {
         }
 
         let mut info = PidfdInfo::default();
-        info.mask = flags.0;
+        info.mask = flags;
 
         let r = unsafe { pidfd_get_info_ioctl(pidfd, &mut info) }.map_err(ioctl_unsupported);
 
@@ -123,7 +128,7 @@ mod lowlevel {
 
         r?;
 
-        assert!(info.mask & flags.0 == flags.0);
+        assert!(info.mask & flags == flags);
         Ok(info)
     }
 
@@ -207,11 +212,16 @@ mod lowlevel {
     }
 
     pub fn pidfd_get_pid(pidfd: RawFd) -> io::Result<i32> {
-        match pidfd_get_info(pidfd, PidfdInfoFlags(PidfdInfoFlags::PID)) {
+        match pidfd_get_info(pidfd, PidfdInfoFlags::PID) {
             Ok(info) => Ok(info.pid as i32),
             Err(nix::Error::EOPNOTSUPP) => pidfd_get_pid_fdinfo(pidfd),
             Err(e) => return Err(e.into()),
         }
+    }
+
+    pub fn pidfd_get_ppid(pidfd: RawFd) -> io::Result<i32> {
+        Ok(pidfd_get_info(pidfd, PidfdInfoFlags::PID)
+            .map(|info| info.ppid as i32)?)
     }
 }
 
@@ -282,17 +292,19 @@ pub use pidfd_impl::*;
 #[cfg(feature = "nightly")]
 pub use std::os::linux::process::PidFd;
 
-use lowlevel::{pidfd_get_pid, pidfd_open};
+use lowlevel::{pidfd_open, pidfd_get_pid, pidfd_get_ppid};
 
 pub trait PidFdExt {
     fn from_pid(pid: i32) -> io::Result<PidFd>;
 
-    fn get_pid(self) -> io::Result<i32>;
+    fn get_pid(&self) -> io::Result<i32>;
+
+    fn get_ppid(&self) -> io::Result<i32>;
+
+    fn access_proc<R, F: FnOnce() -> R>(&self, func: F) -> io::Result<R>;
 
     // / TODO:
     // / https://github.com/systemd/systemd/blob/main/src/basic/pidfd-util.c
-    // / pidfd_get_pid
-    // / pidfd_get_ppid
     // / pidfd_verify_pid (or rather something to look up /proc things in a callback)
     // / pidfd_get_uid
     // / pidfd_get_cgroupid
@@ -301,8 +313,6 @@ pub trait PidFdExt {
     // / ^ equal
     // / https://codeberg.org/PatchMixolydic/pidfd_getfd/src/branch/main/src/linux.rs
     // / pidfd_getfd ? ptrace thing, probably not useful.
-    // / https://github.com/MaxVerevkin/async-pidfd/blob/main/src/lib.rs
-    // / async
     // / https://www.corsix.org/content/what-is-a-pidfd
     // / send_signal (impl for kill)
     // / setns
@@ -317,10 +327,26 @@ impl PidFdExt for PidFd {
         pidfd_open(pid as libc::pid_t).map(PidFd::from)
     }
 
-    fn get_pid(self) -> io::Result<i32> {
+    fn get_pid(&self) -> io::Result<i32> {
         use std::os::fd::AsRawFd;
 
         pidfd_get_pid(self.as_raw_fd())
+    }
+
+    fn get_ppid(&self) -> io::Result<i32> {
+        use std::os::fd::AsRawFd;
+
+        pidfd_get_ppid(self.as_raw_fd())
+    }
+
+    fn access_proc<R, F: FnOnce() -> R>(&self, func: F) -> io::Result<R> {
+        let pid = self.get_pid()?;
+        let result = func();
+        let pid_after = self.get_pid()?;
+
+        if pid != pid_after { return Err(io::ErrorKind::NotFound.into()); }
+
+        return Ok(result);
     }
 }
 
@@ -440,7 +466,48 @@ mod tests {
 
     #[test]
     fn test_pid() {
-        let pidfd = PidFd::from_pid(std::process::id().try_into().unwrap()).unwrap();
-        assert_eq!(pidfd.get_pid().unwrap(), std::process::id() as i32);
+        use std::process::id;
+
+        let pidfd = PidFd::from_pid(id().try_into().unwrap()).unwrap();
+        match pidfd.get_pid() {
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::Unsupported),
+            Ok(pid) => assert_eq!(pid, id() as i32),
+        }
+    }
+
+    #[test]
+    fn test_ppid() {
+        use std::process::id;
+        use std::os::unix::process::parent_id;
+
+        let pidfd = PidFd::from_pid(id().try_into().unwrap()).unwrap();
+        match pidfd.get_ppid() {
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::Unsupported),
+            Ok(pid) => assert_eq!(pid, parent_id() as i32),
+        }
+    }
+
+    #[test]
+    fn test_access_proc() {
+        let child = Command::new("/bin/sh").arg("-c").arg("sleep 1000").spawn().unwrap();
+        let pidfd = PidFd::from_pid(child.id().try_into().unwrap()).unwrap();
+        let result = pidfd.access_proc(|| {
+            return 42;
+        });
+        pidfd.kill().unwrap();
+        pidfd.wait().unwrap();
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    #[test]
+    fn test_access_proc_fail() {
+        let child = Command::new("/bin/sh").arg("-c").arg("sleep 1000").spawn().unwrap();
+        let pidfd = PidFd::from_pid(child.id().try_into().unwrap()).unwrap();
+        let result = pidfd.access_proc(|| {
+            pidfd.kill().unwrap();
+            pidfd.wait().unwrap();
+            return 42;
+        });
+        result.unwrap_err();
     }
 }
