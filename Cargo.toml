@@ -10,7 +10,9 @@ nightly = []
 [dependencies]
 libc = { version = "0.2.171" }
 async-io = { version = "2.4.0" }
-nix = { version = "0.29.0" }
+nix = { version = "0.29.0", features = [
+    "ioctl",
+] }
 
 [dev-dependencies]
 futures-lite = "2.0"

@@ -1,5 +1,8 @@
 #![cfg_attr(feature = "nightly", feature(linux_pidfd))]
 
+/*
+ * FIXME: make async a feature
+ */
 use async_io::Async;
 use std::{io, process::ExitStatus};
 
@@ -10,6 +13,7 @@ mod lowlevel {
     use std::os::unix::process::ExitStatusExt;
     #[cfg(not(feature = "nightly"))]
     use std::process::ExitStatus;
+    use nix::ioctl_readwrite;
 
     trait IsMinusOne {
         fn is_minus_one(&self) -> bool;
@@ -31,6 +35,96 @@ mod lowlevel {
         } else {
             Ok(t)
         }
+    }
+
+    fn ioctl_unsupported(e: nix::Error) -> nix::Error {
+        match e {
+            nix::Error::EOPNOTSUPP |
+            nix::Error::ENOTTY |
+            nix::Error::ENOSYS |
+            nix::Error::EAFNOSUPPORT |
+            nix::Error::EPFNOSUPPORT |
+            nix::Error::EPROTONOSUPPORT |
+            nix::Error::ESOCKTNOSUPPORT |
+            nix::Error::ENOPROTOOPT => nix::Error::EOPNOTSUPP,
+            e => e,
+        }
+    }
+
+    const PIDFS_IOCTL_MAGIC: u8 = 0xFF;
+    const PIDFS_IOCTL_GET_INFO: u8 = 11;
+
+    #[non_exhaustive]
+    struct PidfdInfoFlags(u64);
+
+    impl PidfdInfoFlags {
+        /* Always returned, even if not requested */
+        pub const PID: u64 = 1 << 0;
+        /* Always returned, even if not requested */
+        #[allow(dead_code)]
+        pub const CREDS: u64 = 1 << 1;
+        /* Always returned if available, even if not requested */
+        #[allow(dead_code)]
+        pub const CGROUPID: u64 = 1 << 2;
+        /* Only returned if requested. */
+        #[allow(dead_code)]
+        pub const EXIT: u64 = 1 << 3;
+    }
+
+    #[derive(Debug, Default)]
+    #[repr(C)]
+    struct PidfdInfo {
+        mask: u64,
+        cgroupid: u64,
+        pid: u32,
+        tgid: u32,
+        ppid: u32,
+        ruid: u32,
+        rgid: u32,
+        euid: u32,
+        egid: u32,
+        suid: u32,
+        sgid: u32,
+        fsuid: u32,
+        fsgid: u32,
+        exit_code: i32,
+    }
+
+    ioctl_readwrite!(pidfd_get_info_ioctl, PIDFS_IOCTL_MAGIC, PIDFS_IOCTL_GET_INFO, PidfdInfo);
+
+    fn pidfd_get_info(pidfd: RawFd, flags: PidfdInfoFlags) -> Result<PidfdInfo, nix::Error> {
+        use std::sync::atomic::AtomicU8;
+        use std::sync::atomic::Ordering;
+
+        assert_eq!(64, std::mem::size_of::<PidfdInfo>());
+
+        static PIDFD_GET_INFO_SUPPORTED: AtomicU8 = AtomicU8::new(0);
+        const UNKNOWN: u8 = 0;
+        const YES: u8 = 1;
+        const NO: u8 = 2;
+
+        let mut supported = PIDFD_GET_INFO_SUPPORTED.load(Ordering::Relaxed);
+        if supported == NO {
+            return Err(nix::Error::EOPNOTSUPP);
+        }
+
+        let mut info = PidfdInfo::default();
+        info.mask = flags.0;
+
+        let r = unsafe { pidfd_get_info_ioctl(pidfd, &mut info) }.map_err(ioctl_unsupported);
+
+        if supported == UNKNOWN {
+            match r {
+                Err(nix::Error::EOPNOTSUPP) => supported = NO,
+                _ => supported = YES,
+            }
+            PIDFD_GET_INFO_SUPPORTED.store(supported, Ordering::Relaxed);
+        }
+
+        r?;
+
+        assert!(info.mask & flags.0 == flags.0);
+        Ok(info)
     }
 
     pub fn pidfd_open(pid: libc::pid_t) -> io::Result<OwnedFd> {
@@ -99,7 +193,7 @@ mod lowlevel {
     fn pidfd_get_pid_fdinfo(pidfd: RawFd) -> io::Result<i32> {
         use std::fs::read_to_string;
 
-        let fdinfo = read_to_string(&format!("/proc/self/fdinfo/{pidfd}"))?;
+        let fdinfo = read_to_string(format!("/proc/self/fdinfo/{pidfd}"))?;
         let pidline = fdinfo
             .split('\n')
             .find(|s| s.starts_with("Pid:"))
@@ -113,7 +207,11 @@ mod lowlevel {
     }
 
     pub fn pidfd_get_pid(pidfd: RawFd) -> io::Result<i32> {
-        pidfd_get_pid_fdinfo(pidfd)
+        match pidfd_get_info(pidfd, PidfdInfoFlags(PidfdInfoFlags::PID)) {
+            Ok(info) => Ok(info.pid as i32),
+            Err(nix::Error::EOPNOTSUPP) => pidfd_get_pid_fdinfo(pidfd),
+            Err(e) => return Err(e.into()),
+        }
     }
 }
 
@@ -292,7 +390,7 @@ mod tests {
     async fn async_spawn_and_status(cmd: &mut Command) -> io::Result<ExitStatus> {
         let child = cmd.spawn()?;
         let pidfd: AsyncPidFd = PidFd::from_pid(child.id().try_into().unwrap())?.try_into()?;
-        Ok(pidfd.wait().await?)
+        pidfd.wait().await
     }
 
     #[test]
