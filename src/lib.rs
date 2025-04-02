@@ -4,10 +4,11 @@
  * FIXME: make async a feature
  */
 use async_io::Async;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::{io, process::ExitStatus};
 
 mod lowlevel {
-    use nix::ioctl_readwrite;
+    use nix::{ioctl_readwrite, request_code_none};
     use std::io;
     use std::os::fd::{FromRawFd, OwnedFd, RawFd};
     #[cfg(not(feature = "nightly"))]
@@ -52,7 +53,60 @@ mod lowlevel {
     }
 
     const PIDFS_IOCTL_MAGIC: u8 = 0xFF;
+
+    const PIDFS_IOCTL_GET_CGROUP_NAMESPACE: u8 = 1;
+    const PIDFS_IOCTL_GET_IPC_NAMESPACE: u8 = 2;
+    const PIDFS_IOCTL_GET_MNT_NAMESPACE: u8 = 3;
+    const PIDFS_IOCTL_GET_NET_NAMESPACE: u8 = 4;
+    const PIDFS_IOCTL_GET_PID_NAMESPACE: u8 = 5;
+    const PIDFS_IOCTL_GET_PID_FOR_CHILDREN_NAMESPACE: u8 = 6;
+    const PIDFS_IOCTL_GET_TIME_NAMESPACE: u8 = 7;
+    const PIDFS_IOCTL_GET_TIME_FOR_CHILDREN_NAMESPACE: u8 = 8;
+    const PIDFS_IOCTL_GET_USER_NAMESPACE: u8 = 9;
+    const PIDFS_IOCTL_GET_UTS_NAMESPACE: u8 = 10;
     const PIDFS_IOCTL_GET_INFO: u8 = 11;
+
+    // FIXME: maybe replace with nix::sched::CloneFlags?
+    pub enum PidfdGetNamespace {
+        Cgroup,
+        Ipc,
+        Mnt,
+        Net,
+        Pid,
+        PidForChildren,
+        Time,
+        TimeForChildren,
+        User,
+        Uts,
+    }
+
+    impl PidfdGetNamespace {
+        // FIXME can this be called from outside?
+        fn as_ioctl(&self) -> u8 {
+            match self {
+                PidfdGetNamespace::Cgroup => PIDFS_IOCTL_GET_CGROUP_NAMESPACE,
+                PidfdGetNamespace::Ipc => PIDFS_IOCTL_GET_IPC_NAMESPACE,
+                PidfdGetNamespace::Mnt => PIDFS_IOCTL_GET_MNT_NAMESPACE,
+                PidfdGetNamespace::Net => PIDFS_IOCTL_GET_NET_NAMESPACE,
+                PidfdGetNamespace::Pid => PIDFS_IOCTL_GET_PID_NAMESPACE,
+                PidfdGetNamespace::PidForChildren => PIDFS_IOCTL_GET_PID_FOR_CHILDREN_NAMESPACE,
+                PidfdGetNamespace::Time => PIDFS_IOCTL_GET_TIME_NAMESPACE,
+                PidfdGetNamespace::TimeForChildren => PIDFS_IOCTL_GET_TIME_FOR_CHILDREN_NAMESPACE,
+                PidfdGetNamespace::User => PIDFS_IOCTL_GET_USER_NAMESPACE,
+                PidfdGetNamespace::Uts => PIDFS_IOCTL_GET_UTS_NAMESPACE,
+            }
+        }
+    }
+
+    pub fn pidfd_get_namespace(pidfd: RawFd, ns: &PidfdGetNamespace) -> io::Result<OwnedFd> {
+        unsafe {
+            let fd = cvt(libc::ioctl(
+                pidfd,
+                request_code_none!(PIDFS_IOCTL_MAGIC, ns.as_ioctl()),
+            ))?;
+            Ok(OwnedFd::from_raw_fd(fd))
+        }
+    }
 
     #[non_exhaustive]
     struct PidfdInfoFlags;
@@ -97,6 +151,7 @@ mod lowlevel {
         PidfdInfo
     );
 
+    // FIXME: don't leak nix dependency
     fn pidfd_get_info(pidfd: RawFd, flags: u64) -> Result<PidfdInfo, nix::Error> {
         use std::sync::atomic::AtomicU8;
         use std::sync::atomic::Ordering;
@@ -113,8 +168,10 @@ mod lowlevel {
             return Err(nix::Error::EOPNOTSUPP);
         }
 
-        let mut info = PidfdInfo::default();
-        info.mask = flags;
+        let mut info = PidfdInfo {
+            mask: flags,
+            ..Default::default()
+        };
 
         let r = unsafe { pidfd_get_info_ioctl(pidfd, &mut info) }.map_err(ioctl_unsupported);
 
@@ -139,13 +196,12 @@ mod lowlevel {
         }
     }
 
-    #[cfg(not(feature = "nightly"))]
-    pub fn pidfd_kill(pidfd: RawFd) -> io::Result<()> {
+    pub fn pidfd_send_signal(pidfd: RawFd, signal: libc::c_int) -> io::Result<()> {
         cvt(unsafe {
             libc::syscall(
                 libc::SYS_pidfd_send_signal,
                 pidfd,
-                libc::SIGKILL,
+                signal,
                 std::ptr::null::<()>(),
                 0,
             )
@@ -215,19 +271,73 @@ mod lowlevel {
         match pidfd_get_info(pidfd, PidfdInfoFlags::PID) {
             Ok(info) => Ok(info.pid as i32),
             Err(nix::Error::EOPNOTSUPP) => pidfd_get_pid_fdinfo(pidfd),
-            Err(e) => return Err(e.into()),
+            Err(e) => Err(e.into()),
         }
     }
 
     pub fn pidfd_get_ppid(pidfd: RawFd) -> io::Result<i32> {
-        Ok(pidfd_get_info(pidfd, PidfdInfoFlags::PID)
-            .map(|info| info.ppid as i32)?)
+        Ok(pidfd_get_info(pidfd, PidfdInfoFlags::PID).map(|info| info.ppid as i32)?)
+    }
+
+    pub struct PidfdCreds {
+        pub ruid: u32,
+        pub rgid: u32,
+        pub euid: u32,
+        pub egid: u32,
+        pub suid: u32,
+        pub sgid: u32,
+        pub fsuid: u32,
+        pub fsgid: u32,
+    }
+
+    pub fn pidfd_get_creds(pidfd: RawFd) -> io::Result<PidfdCreds> {
+        Ok(
+            pidfd_get_info(pidfd, PidfdInfoFlags::CREDS).map(|info| PidfdCreds {
+                ruid: info.ruid,
+                rgid: info.rgid,
+                euid: info.euid,
+                egid: info.egid,
+                suid: info.suid,
+                sgid: info.sgid,
+                fsuid: info.fsuid,
+                fsgid: info.fsgid,
+            })?,
+        )
+    }
+
+    pub fn pidfd_get_cgroupid(pidfd: RawFd) -> io::Result<u64> {
+        Ok(pidfd_get_info(pidfd, PidfdInfoFlags::PID).map(|info| info.cgroupid)?)
+    }
+
+    pub fn pidfd_get_inode_id(pidfd: RawFd) -> io::Result<u64> {
+        use nix::sys::stat::fstat;
+        // FIXME make sure pidfd is actually a pidfd (check_pidfs)
+
+        // TODO: look into name_to_handle_at
+
+        let stat = fstat(pidfd)?;
+        // FIXME make into compile time
+        assert_eq!(8, std::mem::size_of_val(&stat.st_ino));
+
+        Ok(stat.st_ino)
+    }
+
+    pub fn pidfd_getfd(pidfd: RawFd, targetfd: i32) -> io::Result<OwnedFd> {
+        unsafe {
+            let fd = cvt(libc::syscall(
+                libc::SYS_pidfd_getfd,
+                pidfd as libc::c_int,
+                targetfd as libc::c_int,
+                0,
+            ) as libc::c_int)?;
+            Ok(OwnedFd::from_raw_fd(fd as libc::c_int))
+        }
     }
 }
 
 #[cfg(not(feature = "nightly"))]
 mod pidfd_impl {
-    use super::lowlevel::{pidfd_kill, pidfd_try_wait, pidfd_wait};
+    use super::lowlevel::{pidfd_send_signal, pidfd_try_wait, pidfd_wait};
     use std::io;
     use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
     use std::process::ExitStatus;
@@ -236,7 +346,7 @@ mod pidfd_impl {
 
     impl PidFd {
         pub fn kill(&self) -> io::Result<()> {
-            pidfd_kill(self.0.as_raw_fd())
+            pidfd_send_signal(self.0.as_raw_fd(), libc::SIGKILL)
         }
 
         pub fn wait(&self) -> io::Result<ExitStatus> {
@@ -289,10 +399,14 @@ mod pidfd_impl {
 #[cfg(not(feature = "nightly"))]
 pub use pidfd_impl::*;
 
+pub use lowlevel::{PidfdCreds, PidfdGetNamespace};
+use lowlevel::{
+    pidfd_get_cgroupid, pidfd_get_creds, pidfd_get_inode_id, pidfd_get_namespace, pidfd_get_pid,
+    pidfd_get_ppid, pidfd_getfd, pidfd_open, pidfd_send_signal,
+};
+pub use nix::sched::CloneFlags;
 #[cfg(feature = "nightly")]
 pub use std::os::linux::process::PidFd;
-
-use lowlevel::{pidfd_open, pidfd_get_pid, pidfd_get_ppid};
 
 pub trait PidFdExt {
     fn from_pid(pid: i32) -> io::Result<PidFd>;
@@ -301,29 +415,26 @@ pub trait PidFdExt {
 
     fn get_ppid(&self) -> io::Result<i32>;
 
+    fn get_id(&self) -> io::Result<u64>;
+
+    fn get_creds(&self) -> io::Result<PidfdCreds>;
+
+    fn get_cgroupid(&self) -> io::Result<u64>;
+
+    fn get_namespace(&self, ns: &PidfdGetNamespace) -> io::Result<OwnedFd>;
+
     fn access_proc<R, F: FnOnce() -> R>(&self, func: F) -> io::Result<R>;
 
-    // / TODO:
-    // / https://github.com/systemd/systemd/blob/main/src/basic/pidfd-util.c
-    // / pidfd_verify_pid (or rather something to look up /proc things in a callback)
-    // / pidfd_get_uid
-    // / pidfd_get_cgroupid
-    // / pidfd_get_namespace?
-    // / pidfd_get_inode_id? This returns a unique id for the process which is not racy (statx, stx_ino;) is pidfd different process?
-    // / ^ equal
-    // / https://codeberg.org/PatchMixolydic/pidfd_getfd/src/branch/main/src/linux.rs
-    // / pidfd_getfd ? ptrace thing, probably not useful.
-    // / https://www.corsix.org/content/what-is-a-pidfd
-    // / send_signal (impl for kill)
-    // / setns
-    //
-    // verify pid as pidfd (systemd)
-    //
-    // /
+    fn send_signal(&self, signal: i32) -> io::Result<()>;
+
+    fn set_namespace(&self, ns: CloneFlags) -> io::Result<()>;
+
+    fn get_remote_fd(&self, target_fd: i32) -> io::Result<OwnedFd>;
 }
 
 impl PidFdExt for PidFd {
     fn from_pid(pid: i32) -> io::Result<PidFd> {
+        // FIXME: verify pid as pidfd (see systemd)
         pidfd_open(pid as libc::pid_t).map(PidFd::from)
     }
 
@@ -339,14 +450,44 @@ impl PidFdExt for PidFd {
         pidfd_get_ppid(self.as_raw_fd())
     }
 
+    fn get_id(&self) -> io::Result<u64> {
+        pidfd_get_inode_id(self.as_raw_fd())
+    }
+
+    fn get_creds(&self) -> io::Result<PidfdCreds> {
+        pidfd_get_creds(self.as_raw_fd())
+    }
+
+    fn get_cgroupid(&self) -> io::Result<u64> {
+        pidfd_get_cgroupid(self.as_raw_fd())
+    }
+
+    fn get_namespace(&self, ns: &PidfdGetNamespace) -> io::Result<OwnedFd> {
+        pidfd_get_namespace(self.as_raw_fd(), ns)
+    }
+
     fn access_proc<R, F: FnOnce() -> R>(&self, func: F) -> io::Result<R> {
         let pid = self.get_pid()?;
         let result = func();
         let pid_after = self.get_pid()?;
 
-        if pid != pid_after { return Err(io::ErrorKind::NotFound.into()); }
+        if pid != pid_after {
+            return Err(io::ErrorKind::NotFound.into());
+        }
 
-        return Ok(result);
+        Ok(result)
+    }
+
+    fn send_signal(&self, signal: i32) -> io::Result<()> {
+        pidfd_send_signal(self.as_raw_fd(), signal)
+    }
+
+    fn set_namespace(&self, ns: CloneFlags) -> io::Result<()> {
+        Ok(nix::sched::setns(self, ns)?)
+    }
+
+    fn get_remote_fd(&self, target_fd: i32) -> io::Result<OwnedFd> {
+        pidfd_getfd(self.as_raw_fd(), target_fd)
     }
 }
 
@@ -477,8 +618,8 @@ mod tests {
 
     #[test]
     fn test_ppid() {
-        use std::process::id;
         use std::os::unix::process::parent_id;
+        use std::process::id;
 
         let pidfd = PidFd::from_pid(id().try_into().unwrap()).unwrap();
         match pidfd.get_ppid() {
@@ -489,11 +630,14 @@ mod tests {
 
     #[test]
     fn test_access_proc() {
-        let child = Command::new("/bin/sh").arg("-c").arg("sleep 1000").spawn().unwrap();
+        #[allow(clippy::zombie_processes)]
+        let child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 1000")
+            .spawn()
+            .unwrap();
         let pidfd = PidFd::from_pid(child.id().try_into().unwrap()).unwrap();
-        let result = pidfd.access_proc(|| {
-            return 42;
-        });
+        let result = pidfd.access_proc(|| 42);
         pidfd.kill().unwrap();
         pidfd.wait().unwrap();
         assert_eq!(result.unwrap(), 42);
@@ -501,13 +645,59 @@ mod tests {
 
     #[test]
     fn test_access_proc_fail() {
-        let child = Command::new("/bin/sh").arg("-c").arg("sleep 1000").spawn().unwrap();
+        #[allow(clippy::zombie_processes)]
+        let child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 1000")
+            .spawn()
+            .unwrap();
         let pidfd = PidFd::from_pid(child.id().try_into().unwrap()).unwrap();
         let result = pidfd.access_proc(|| {
             pidfd.kill().unwrap();
             pidfd.wait().unwrap();
-            return 42;
+            42
         });
         result.unwrap_err();
+    }
+
+    #[test]
+    fn test_id() {
+        use std::process::id;
+
+        let pidfd1 = PidFd::from_pid(id().try_into().unwrap()).unwrap();
+        let pidfd2 = PidFd::from_pid(id().try_into().unwrap()).unwrap();
+        assert_eq!(pidfd1.get_id().unwrap(), pidfd2.get_id().unwrap());
+
+        let mut child = Command::new("/bin/true").spawn().unwrap();
+        let pidfd3 = PidFd::from_pid(child.id().try_into().unwrap()).unwrap();
+        assert_ne!(pidfd1.get_id().unwrap(), pidfd3.get_id().unwrap());
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn test_creds() {
+        use nix::unistd::{Gid, Uid};
+        use std::process::id;
+
+        let pidfd = PidFd::from_pid(id().try_into().unwrap()).unwrap();
+        let creds = pidfd.get_creds().unwrap();
+        assert_eq!(creds.ruid, Uid::current().as_raw());
+        assert_eq!(creds.euid, Uid::effective().as_raw());
+        assert_eq!(creds.rgid, Gid::current().as_raw());
+        assert_eq!(creds.egid, Gid::effective().as_raw());
+    }
+    #[test]
+    fn test_get_namespace() {
+        // FIXME, how to test? probably needs some user namespace magic
+    }
+
+    #[test]
+    fn test_set_namespace() {
+        // FIXME, how to test? probably needs some user namespace magic
+    }
+
+    #[test]
+    fn test_get_remote_fd() {
+        // FIXME, how to test? needs ptrace permission. probably need to do some user namespace thing...
     }
 }
