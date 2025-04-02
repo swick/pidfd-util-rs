@@ -1,49 +1,60 @@
 #![cfg_attr(feature = "nightly", feature(linux_pidfd))]
 
 use async_io::Async;
-use std::{
-    io,
-    os::fd::{FromRawFd, OwnedFd},
-    process::ExitStatus,
-};
+use std::{io, process::ExitStatus};
 
-trait IsMinusOne {
-    fn is_minus_one(&self) -> bool;
-}
+mod lowlevel {
+    use std::io;
+    use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+    #[cfg(not(feature = "nightly"))]
+    use std::os::unix::process::ExitStatusExt;
+    #[cfg(not(feature = "nightly"))]
+    use std::process::ExitStatus;
 
-macro_rules! impl_is_minus_one {
-    ($($t:ident)*) => ($(impl IsMinusOne for $t {
-        fn is_minus_one(&self) -> bool {
-            *self == -1
-        }
-    })*)
-}
-
-impl_is_minus_one! { i8 i16 i32 i64 isize }
-
-fn cvt<T: IsMinusOne>(t: T) -> io::Result<T> {
-    if t.is_minus_one() {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(t)
+    trait IsMinusOne {
+        fn is_minus_one(&self) -> bool;
     }
-}
 
-#[cfg(feature = "nightly")]
-pub use std::os::linux::process::PidFd;
+    macro_rules! impl_is_minus_one {
+        ($($t:ident)*) => ($(impl IsMinusOne for $t {
+            fn is_minus_one(&self) -> bool {
+                *self == -1
+            }
+        })*)
+    }
 
-#[cfg(not(feature = "nightly"))]
-mod imported_nightly_impl {
-    use super::cvt;
-    use std::{
-        io,
-        os::{
-            fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
-            unix::process::ExitStatusExt,
-        },
-        process::ExitStatus,
-    };
+    impl_is_minus_one! { i8 i16 i32 i64 isize }
 
+    fn cvt<T: IsMinusOne>(t: T) -> io::Result<T> {
+        if t.is_minus_one() {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(t)
+        }
+    }
+
+    pub fn pidfd_open(pid: libc::pid_t) -> io::Result<OwnedFd> {
+        unsafe {
+            let fd = cvt(libc::syscall(libc::SYS_pidfd_open, pid, 0))?;
+            Ok(OwnedFd::from_raw_fd(fd as libc::c_int))
+        }
+    }
+
+    #[cfg(not(feature = "nightly"))]
+    pub fn pidfd_kill(pidfd: RawFd) -> io::Result<()> {
+        cvt(unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                pidfd,
+                libc::SIGKILL,
+                std::ptr::null::<()>(),
+                0,
+            )
+        })
+        .map(drop)
+    }
+
+    #[cfg(not(feature = "nightly"))]
     fn from_waitid_siginfo(siginfo: libc::siginfo_t) -> ExitStatus {
         let status = unsafe { siginfo.si_status() };
 
@@ -59,51 +70,73 @@ mod imported_nightly_impl {
         }
     }
 
+    #[cfg(not(feature = "nightly"))]
+    pub fn pidfd_wait(pidfd: RawFd) -> io::Result<ExitStatus> {
+        let mut siginfo: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        cvt(unsafe { libc::waitid(libc::P_PIDFD, pidfd as u32, &mut siginfo, libc::WEXITED) })?;
+        Ok(from_waitid_siginfo(siginfo))
+    }
+
+    #[cfg(not(feature = "nightly"))]
+    pub fn pidfd_try_wait(pidfd: RawFd) -> io::Result<Option<ExitStatus>> {
+        let mut siginfo: libc::siginfo_t = unsafe { std::mem::zeroed() };
+
+        cvt(unsafe {
+            libc::waitid(
+                libc::P_PIDFD,
+                pidfd as u32,
+                &mut siginfo,
+                libc::WEXITED | libc::WNOHANG,
+            )
+        })?;
+        if unsafe { siginfo.si_pid() } == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(from_waitid_siginfo(siginfo)))
+        }
+    }
+
+    fn pidfd_get_pid_fdinfo(pidfd: RawFd) -> io::Result<i32> {
+        use std::fs::read_to_string;
+
+        let fdinfo = read_to_string(&format!("/proc/self/fdinfo/{pidfd}"))?;
+        let pidline = fdinfo
+            .split('\n')
+            .find(|s| s.starts_with("Pid:"))
+            .ok_or(io::ErrorKind::Unsupported)?;
+        Ok(pidline
+            .split('\t')
+            .next_back()
+            .ok_or(io::ErrorKind::Unsupported)?
+            .parse::<i32>()
+            .map_err(|_| io::ErrorKind::Unsupported)?)
+    }
+
+    pub fn pidfd_get_pid(pidfd: RawFd) -> io::Result<i32> {
+        pidfd_get_pid_fdinfo(pidfd)
+    }
+}
+
+#[cfg(not(feature = "nightly"))]
+mod pidfd_impl {
+    use super::lowlevel::{pidfd_kill, pidfd_try_wait, pidfd_wait};
+    use std::io;
+    use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+    use std::process::ExitStatus;
+
     pub struct PidFd(OwnedFd);
 
     impl PidFd {
         pub fn kill(&self) -> io::Result<()> {
-            cvt(unsafe {
-                libc::syscall(
-                    libc::SYS_pidfd_send_signal,
-                    self.0.as_raw_fd(),
-                    libc::SIGKILL,
-                    std::ptr::null::<()>(),
-                    0,
-                )
-            })
-            .map(drop)
+            pidfd_kill(self.0.as_raw_fd())
         }
 
         pub fn wait(&self) -> io::Result<ExitStatus> {
-            let mut siginfo: libc::siginfo_t = unsafe { std::mem::zeroed() };
-            cvt(unsafe {
-                libc::waitid(
-                    libc::P_PIDFD,
-                    self.0.as_raw_fd() as u32,
-                    &mut siginfo,
-                    libc::WEXITED,
-                )
-            })?;
-            Ok(from_waitid_siginfo(siginfo))
+            pidfd_wait(self.0.as_raw_fd())
         }
 
         pub fn try_wait(&self) -> io::Result<Option<ExitStatus>> {
-            let mut siginfo: libc::siginfo_t = unsafe { std::mem::zeroed() };
-
-            cvt(unsafe {
-                libc::waitid(
-                    libc::P_PIDFD,
-                    self.0.as_raw_fd() as u32,
-                    &mut siginfo,
-                    libc::WEXITED | libc::WNOHANG,
-                )
-            })?;
-            if unsafe { siginfo.si_pid() } == 0 {
-                Ok(None)
-            } else {
-                Ok(Some(from_waitid_siginfo(siginfo)))
-            }
+            pidfd_try_wait(self.0.as_raw_fd())
         }
     }
 
@@ -146,10 +179,17 @@ mod imported_nightly_impl {
 }
 
 #[cfg(not(feature = "nightly"))]
-pub use imported_nightly_impl::*;
+pub use pidfd_impl::*;
+
+#[cfg(feature = "nightly")]
+pub use std::os::linux::process::PidFd;
+
+use lowlevel::{pidfd_get_pid, pidfd_open};
 
 pub trait PidFdExt {
-    fn from_pid(pid: libc::pid_t) -> io::Result<PidFd>;
+    fn from_pid(pid: i32) -> io::Result<PidFd>;
+
+    fn get_pid(self) -> io::Result<i32>;
 
     // / TODO:
     // / https://github.com/systemd/systemd/blob/main/src/basic/pidfd-util.c
@@ -168,17 +208,21 @@ pub trait PidFdExt {
     // / https://www.corsix.org/content/what-is-a-pidfd
     // / send_signal (impl for kill)
     // / setns
+    //
+    // verify pid as pidfd (systemd)
+    //
     // /
 }
 
 impl PidFdExt for PidFd {
-    fn from_pid(pid: libc::pid_t) -> io::Result<PidFd> {
-        let pidfd: std::result::Result<OwnedFd, io::Error> = unsafe {
-            let fd = cvt(libc::syscall(libc::SYS_pidfd_open, pid, 0))?;
-            Ok(OwnedFd::from_raw_fd(fd as libc::c_int))
-        };
+    fn from_pid(pid: i32) -> io::Result<PidFd> {
+        pidfd_open(pid as libc::pid_t).map(PidFd::from)
+    }
 
-        pidfd.map(PidFd::from)
+    fn get_pid(self) -> io::Result<i32> {
+        use std::os::fd::AsRawFd;
+
+        pidfd_get_pid(self.as_raw_fd())
     }
 }
 
@@ -208,12 +252,12 @@ mod tests {
 
     fn spawn_and_status(cmd: &mut Command) -> io::Result<ExitStatus> {
         let child = cmd.spawn()?;
-        let pidfd = PidFd::from_pid(child.id() as libc::pid_t)?;
+        let pidfd = PidFd::from_pid(child.id().try_into().unwrap())?;
         pidfd.wait()
     }
 
     #[test]
-    fn status() -> io::Result<()> {
+    fn test_status() -> io::Result<()> {
         let status = spawn_and_status(&mut Command::new("/bin/true"))?;
         assert_eq!(status.code(), Some(0));
         assert_eq!(status.signal(), None);
@@ -237,7 +281,7 @@ mod tests {
     #[test]
     fn test_wait_twice() -> io::Result<()> {
         let child = Command::new("/bin/true").spawn()?;
-        let pidfd = PidFd::from_pid(child.id() as libc::pid_t)?;
+        let pidfd = PidFd::from_pid(child.id().try_into().unwrap())?;
         let status = pidfd.wait()?;
         assert!(status.success());
         let ret = pidfd.wait();
@@ -247,7 +291,7 @@ mod tests {
 
     async fn async_spawn_and_status(cmd: &mut Command) -> io::Result<ExitStatus> {
         let child = cmd.spawn()?;
-        let pidfd: AsyncPidFd = PidFd::from_pid(child.id() as libc::pid_t)?.try_into()?;
+        let pidfd: AsyncPidFd = PidFd::from_pid(child.id().try_into().unwrap())?.try_into()?;
         Ok(pidfd.wait().await?)
     }
 
@@ -297,9 +341,8 @@ mod tests {
     }
 
     #[test]
-    fn it_works() {
-        let _pidfd = PidFd::from_pid(std::process::id().try_into().unwrap()).unwrap();
-
-        //pidfd.kill().unwrap();
+    fn test_pid() {
+        let pidfd = PidFd::from_pid(std::process::id().try_into().unwrap()).unwrap();
+        assert_eq!(pidfd.get_pid().unwrap(), std::process::id() as i32);
     }
 }
