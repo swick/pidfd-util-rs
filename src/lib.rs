@@ -10,11 +10,13 @@ use std::{io, process::ExitStatus};
 mod lowlevel {
     use nix::{ioctl_readwrite, request_code_none};
     use std::io;
-    use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+    use std::os::fd::{FromRawFd, OwnedFd, RawFd, AsFd, AsRawFd};
     #[cfg(not(feature = "nightly"))]
     use std::os::unix::process::ExitStatusExt;
     #[cfg(not(feature = "nightly"))]
     use std::process::ExitStatus;
+
+    const PID_FS_MAGIC: u64 = 0x50494446;
 
     trait IsMinusOne {
         fn is_minus_one(&self) -> bool;
@@ -98,10 +100,10 @@ mod lowlevel {
         }
     }
 
-    pub fn pidfd_get_namespace(pidfd: RawFd, ns: &PidfdGetNamespace) -> io::Result<OwnedFd> {
+    pub fn pidfd_get_namespace<Fd: AsRawFd>(pidfd: &Fd, ns: &PidfdGetNamespace) -> io::Result<OwnedFd> {
         unsafe {
             let fd = cvt(libc::ioctl(
-                pidfd,
+                pidfd.as_raw_fd(),
                 request_code_none!(PIDFS_IOCTL_MAGIC, ns.as_ioctl()),
             ))?;
             Ok(OwnedFd::from_raw_fd(fd))
@@ -152,7 +154,7 @@ mod lowlevel {
     );
 
     // FIXME: don't leak nix dependency
-    fn pidfd_get_info(pidfd: RawFd, flags: u64) -> Result<PidfdInfo, nix::Error> {
+    fn pidfd_get_info<Fd: AsRawFd>(pidfd: &Fd, flags: u64) -> Result<PidfdInfo, nix::Error> {
         use std::sync::atomic::AtomicU8;
         use std::sync::atomic::Ordering;
 
@@ -173,7 +175,7 @@ mod lowlevel {
             ..Default::default()
         };
 
-        let r = unsafe { pidfd_get_info_ioctl(pidfd, &mut info) }.map_err(ioctl_unsupported);
+        let r = unsafe { pidfd_get_info_ioctl(pidfd.as_raw_fd(), &mut info) }.map_err(ioctl_unsupported);
 
         if supported == UNKNOWN {
             match r {
@@ -196,11 +198,11 @@ mod lowlevel {
         }
     }
 
-    pub fn pidfd_send_signal(pidfd: RawFd, signal: libc::c_int) -> io::Result<()> {
+    pub fn pidfd_send_signal<Fd: AsRawFd>(pidfd: &Fd, signal: libc::c_int) -> io::Result<()> {
         cvt(unsafe {
             libc::syscall(
                 libc::SYS_pidfd_send_signal,
-                pidfd,
+                pidfd.as_raw_fd(),
                 signal,
                 std::ptr::null::<()>(),
                 0,
@@ -226,20 +228,20 @@ mod lowlevel {
     }
 
     #[cfg(not(feature = "nightly"))]
-    pub fn pidfd_wait(pidfd: RawFd) -> io::Result<ExitStatus> {
+    pub fn pidfd_wait<Fd: AsRawFd>(pidfd: &Fd) -> io::Result<ExitStatus> {
         let mut siginfo: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        cvt(unsafe { libc::waitid(libc::P_PIDFD, pidfd as u32, &mut siginfo, libc::WEXITED) })?;
+        cvt(unsafe { libc::waitid(libc::P_PIDFD, pidfd.as_raw_fd() as u32, &mut siginfo, libc::WEXITED) })?;
         Ok(from_waitid_siginfo(siginfo))
     }
 
     #[cfg(not(feature = "nightly"))]
-    pub fn pidfd_try_wait(pidfd: RawFd) -> io::Result<Option<ExitStatus>> {
+    pub fn pidfd_try_wait<Fd: AsRawFd>(pidfd: &Fd) -> io::Result<Option<ExitStatus>> {
         let mut siginfo: libc::siginfo_t = unsafe { std::mem::zeroed() };
 
         cvt(unsafe {
             libc::waitid(
                 libc::P_PIDFD,
-                pidfd as u32,
+                pidfd.as_raw_fd() as u32,
                 &mut siginfo,
                 libc::WEXITED | libc::WNOHANG,
             )
@@ -251,10 +253,11 @@ mod lowlevel {
         }
     }
 
-    fn pidfd_get_pid_fdinfo(pidfd: RawFd) -> io::Result<i32> {
+    fn pidfd_get_pid_fdinfo<Fd: AsRawFd>(pidfd: &Fd) -> io::Result<i32> {
         use std::fs::read_to_string;
 
-        let fdinfo = read_to_string(format!("/proc/self/fdinfo/{pidfd}"))?;
+        let raw = pidfd.as_raw_fd();
+        let fdinfo = read_to_string(format!("/proc/self/fdinfo/{raw}"))?;
         let pidline = fdinfo
             .split('\n')
             .find(|s| s.starts_with("Pid:"))
@@ -267,7 +270,7 @@ mod lowlevel {
             .map_err(|_| io::ErrorKind::Unsupported)?)
     }
 
-    pub fn pidfd_get_pid(pidfd: RawFd) -> io::Result<i32> {
+    pub fn pidfd_get_pid<Fd: AsRawFd>(pidfd: &Fd) -> io::Result<i32> {
         match pidfd_get_info(pidfd, PidfdInfoFlags::PID) {
             Ok(info) => Ok(info.pid as i32),
             Err(nix::Error::EOPNOTSUPP) => pidfd_get_pid_fdinfo(pidfd),
@@ -275,7 +278,7 @@ mod lowlevel {
         }
     }
 
-    pub fn pidfd_get_ppid(pidfd: RawFd) -> io::Result<i32> {
+    pub fn pidfd_get_ppid<Fd: AsRawFd>(pidfd: &Fd) -> io::Result<i32> {
         Ok(pidfd_get_info(pidfd, PidfdInfoFlags::PID).map(|info| info.ppid as i32)?)
     }
 
@@ -290,7 +293,7 @@ mod lowlevel {
         pub fsgid: u32,
     }
 
-    pub fn pidfd_get_creds(pidfd: RawFd) -> io::Result<PidfdCreds> {
+    pub fn pidfd_get_creds<Fd: AsRawFd>(pidfd: &Fd) -> io::Result<PidfdCreds> {
         Ok(
             pidfd_get_info(pidfd, PidfdInfoFlags::CREDS).map(|info| PidfdCreds {
                 ruid: info.ruid,
@@ -305,15 +308,21 @@ mod lowlevel {
         )
     }
 
-    pub fn pidfd_get_cgroupid(pidfd: RawFd) -> io::Result<u64> {
+    pub fn pidfd_get_cgroupid<Fd: AsRawFd>(pidfd: &Fd) -> io::Result<u64> {
         Ok(pidfd_get_info(pidfd, PidfdInfoFlags::PID).map(|info| info.cgroupid)?)
     }
 
-    pub fn pidfd_get_inode_id(pidfd: RawFd) -> io::Result<u64> {
+    pub fn pidfd_get_inode_id<Fd: AsFd>(pidfd: &Fd) -> io::Result<u64> {
         use nix::sys::stat::fstat;
+        use nix::sys::statvfs::fstatvfs;
         // FIXME make sure pidfd is actually a pidfd (check_pidfs)
 
         // TODO: look into name_to_handle_at
+
+        let fsstat = fstatvfs(pidfd)?;
+        if fsstat.filesystem_id() == PID_FS_MAGIC {
+            return Err(io::Error::from(io::ErrorKind::Unsupported));
+        }
 
         let stat = fstat(pidfd)?;
         // FIXME make into compile time
@@ -346,15 +355,15 @@ mod pidfd_impl {
 
     impl PidFd {
         pub fn kill(&self) -> io::Result<()> {
-            pidfd_send_signal(self.0.as_raw_fd(), libc::SIGKILL)
+            pidfd_send_signal(self, libc::SIGKILL)
         }
 
         pub fn wait(&self) -> io::Result<ExitStatus> {
-            pidfd_wait(self.0.as_raw_fd())
+            pidfd_wait(self)
         }
 
         pub fn try_wait(&self) -> io::Result<Option<ExitStatus>> {
-            pidfd_try_wait(self.0.as_raw_fd())
+            pidfd_try_wait(self)
         }
     }
 
@@ -439,31 +448,27 @@ impl PidFdExt for PidFd {
     }
 
     fn get_pid(&self) -> io::Result<i32> {
-        use std::os::fd::AsRawFd;
-
-        pidfd_get_pid(self.as_raw_fd())
+        pidfd_get_pid(self)
     }
 
     fn get_ppid(&self) -> io::Result<i32> {
-        use std::os::fd::AsRawFd;
-
-        pidfd_get_ppid(self.as_raw_fd())
+        pidfd_get_ppid(self)
     }
 
     fn get_id(&self) -> io::Result<u64> {
-        pidfd_get_inode_id(self.as_raw_fd())
+        pidfd_get_inode_id(self)
     }
 
     fn get_creds(&self) -> io::Result<PidfdCreds> {
-        pidfd_get_creds(self.as_raw_fd())
+        pidfd_get_creds(self)
     }
 
     fn get_cgroupid(&self) -> io::Result<u64> {
-        pidfd_get_cgroupid(self.as_raw_fd())
+        pidfd_get_cgroupid(self)
     }
 
     fn get_namespace(&self, ns: &PidfdGetNamespace) -> io::Result<OwnedFd> {
-        pidfd_get_namespace(self.as_raw_fd(), ns)
+        pidfd_get_namespace(self, ns)
     }
 
     fn access_proc<R, F: FnOnce() -> R>(&self, func: F) -> io::Result<R> {
@@ -479,7 +484,7 @@ impl PidFdExt for PidFd {
     }
 
     fn send_signal(&self, signal: i32) -> io::Result<()> {
-        pidfd_send_signal(self.as_raw_fd(), signal)
+        pidfd_send_signal(self, signal)
     }
 
     fn set_namespace(&self, ns: CloneFlags) -> io::Result<()> {
