@@ -8,18 +8,16 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::{io, process::ExitStatus};
 
 mod lowlevel {
-    use nix::{ioctl_readwrite, request_code_none};
-    use std::any::Any;
+    use nix;
     use std::io;
-    use std::ops::DerefMut;
     use std::os::fd::{FromRawFd, OwnedFd, RawFd, AsFd, AsRawFd};
     #[cfg(not(feature = "nightly"))]
     use std::os::unix::process::ExitStatusExt;
     #[cfg(not(feature = "nightly"))]
     use std::process::ExitStatus;
+    use std::sync::atomic;
 
     const PID_FS_MAGIC: i64 = 0x50494446;
-
 
     #[repr(u8)]
     #[derive(PartialEq)]
@@ -29,15 +27,15 @@ mod lowlevel {
         No = 2,
     }
 
-    struct AtomicSupported(std::sync::atomic::AtomicU8);
+    struct AtomicSupported(atomic::AtomicU8);
 
     impl AtomicSupported {
         const fn new(supported: Supported) -> Self {
-            Self(std::sync::atomic::AtomicU8::new(supported as u8))
+            Self(atomic::AtomicU8::new(supported as u8))
         }
 
         fn load(&self) -> Supported {
-            match self.0.load(std::sync::atomic::Ordering::Relaxed) {
+            match self.0.load(atomic::Ordering::Relaxed) {
                 0 => Supported::Unknown,
                 1 => Supported::Yes,
                 2 => Supported::No,
@@ -50,7 +48,7 @@ mod lowlevel {
                 Supported::Unknown => 0,
                 Supported::Yes => 1,
                 Supported::No => 2,
-            }, std::sync::atomic::Ordering::Relaxed);
+            }, atomic::Ordering::Relaxed);
         }
     }
 
@@ -140,7 +138,7 @@ mod lowlevel {
         unsafe {
             let fd = cvt(libc::ioctl(
                 pidfd.as_raw_fd(),
-                request_code_none!(PIDFS_IOCTL_MAGIC, ns.as_ioctl()),
+                nix::request_code_none!(PIDFS_IOCTL_MAGIC, ns.as_ioctl()),
             ))?;
             Ok(OwnedFd::from_raw_fd(fd))
         }
@@ -182,14 +180,13 @@ mod lowlevel {
         exit_code: i32,
     }
 
-    ioctl_readwrite!(
+    nix::ioctl_readwrite!(
         pidfd_get_info_ioctl,
         PIDFS_IOCTL_MAGIC,
         PIDFS_IOCTL_GET_INFO,
         PidfdInfo
     );
 
-    // FIXME: don't leak nix dependency
     fn pidfd_get_info<Fd: AsRawFd>(pidfd: &Fd, flags: u64) -> io::Result<PidfdInfo> {
         assert_eq!(64, std::mem::size_of::<PidfdInfo>());
 
@@ -344,10 +341,9 @@ mod lowlevel {
     pub fn pidfd_is_on_pidfs() -> io::Result<bool> {
         use nix::sys::statfs::fstatfs;
 
-        static PIDFD_IS_ON_PIDFS: AtomicSupported = AtomicSupported::new(Supported::Unknown);
+        static SUPPORTED: AtomicSupported = AtomicSupported::new(Supported::Unknown);
 
-        let supported = PIDFD_IS_ON_PIDFS.load();
-        match supported {
+        match SUPPORTED.load() {
             Supported::Unknown => (),
             Supported::Yes => return Ok(true),
             Supported::No => return Ok(false),
@@ -357,10 +353,10 @@ mod lowlevel {
 
         let fsstat = fstatfs(self_pidfd)?;
         if fsstat.filesystem_type().0 == PID_FS_MAGIC {
-            PIDFD_IS_ON_PIDFS.store(Supported::Yes);
+            SUPPORTED.store(Supported::Yes);
             return Ok(true);
         } else {
-            PIDFD_IS_ON_PIDFS.store(Supported::No);
+            SUPPORTED.store(Supported::No);
             return Ok(false);
         }
     }
@@ -396,8 +392,6 @@ mod lowlevel {
                 libc::AT_EMPTY_PATH,
             ) as libc::c_int).unwrap_err();
 
-            // FIXME: check all other instances of supported
-            // rename everything to SUPPORTED
             if err.raw_os_error().unwrap() == libc::EOPNOTSUPP {
                 SUPPORTED.store(Supported::No);
                 return Err(io::ErrorKind::Unsupported.into());
