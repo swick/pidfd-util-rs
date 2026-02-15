@@ -134,10 +134,10 @@ mod lowlevel {
         }
     }
 
-    pub fn pidfd_get_namespace<Fd: AsRawFd>(pidfd: &Fd, ns: &PidfdGetNamespace) -> io::Result<OwnedFd> {
+    pub fn pidfd_get_namespace<Fd: AsFd>(pidfd: &Fd, ns: &PidfdGetNamespace) -> io::Result<OwnedFd> {
         unsafe {
             let fd = cvt(libc::ioctl(
-                pidfd.as_raw_fd(),
+                pidfd.as_fd().as_raw_fd(),
                 nix::request_code_none!(PIDFS_IOCTL_MAGIC, ns.as_ioctl()),
             ))?;
             Ok(OwnedFd::from_raw_fd(fd))
@@ -187,7 +187,7 @@ mod lowlevel {
         PidfdInfo
     );
 
-    fn pidfd_get_info<Fd: AsRawFd>(pidfd: &Fd, flags: u64) -> io::Result<PidfdInfo> {
+    fn pidfd_get_info<Fd: AsFd>(pidfd: &Fd, flags: u64) -> io::Result<PidfdInfo> {
         assert_eq!(64, std::mem::size_of::<PidfdInfo>());
 
         static SUPPORTED: AtomicSupported = AtomicSupported::new(Supported::Unknown);
@@ -202,7 +202,7 @@ mod lowlevel {
             ..Default::default()
         };
 
-        let r = unsafe { pidfd_get_info_ioctl(pidfd.as_raw_fd(), &mut info) }.map_err(ioctl_unsupported);
+        let r = unsafe { pidfd_get_info_ioctl(pidfd.as_fd().as_raw_fd(), &mut info) }.map_err(ioctl_unsupported);
 
         if let Err(e) = r {
             if e == nix::Error::EOPNOTSUPP {
@@ -224,11 +224,11 @@ mod lowlevel {
         }
     }
 
-    pub fn pidfd_send_signal<Fd: AsRawFd>(pidfd: &Fd, signal: libc::c_int) -> io::Result<()> {
+    pub fn pidfd_send_signal<Fd: AsFd>(pidfd: &Fd, signal: libc::c_int) -> io::Result<()> {
         cvt(unsafe {
             libc::syscall(
                 libc::SYS_pidfd_send_signal,
-                pidfd.as_raw_fd(),
+                pidfd.as_fd().as_raw_fd(),
                 signal,
                 std::ptr::null::<()>(),
                 0,
@@ -254,20 +254,27 @@ mod lowlevel {
     }
 
     #[cfg(not(feature = "nightly"))]
-    pub fn pidfd_wait<Fd: AsRawFd>(pidfd: &Fd) -> io::Result<ExitStatus> {
+    pub fn pidfd_wait<Fd: AsFd>(pidfd: &Fd) -> io::Result<ExitStatus> {
         let mut siginfo: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        cvt(unsafe { libc::waitid(libc::P_PIDFD, pidfd.as_raw_fd() as u32, &mut siginfo, libc::WEXITED) })?;
+        cvt(unsafe {
+            libc::waitid(
+                libc::P_PIDFD,
+                pidfd.as_fd().as_raw_fd() as u32,
+                &mut siginfo,
+                libc::WEXITED,
+            )
+        })?;
         Ok(from_waitid_siginfo(siginfo))
     }
 
     #[cfg(not(feature = "nightly"))]
-    pub fn pidfd_try_wait<Fd: AsRawFd>(pidfd: &Fd) -> io::Result<Option<ExitStatus>> {
+    pub fn pidfd_try_wait<Fd: AsFd>(pidfd: &Fd) -> io::Result<Option<ExitStatus>> {
         let mut siginfo: libc::siginfo_t = unsafe { std::mem::zeroed() };
 
         cvt(unsafe {
             libc::waitid(
                 libc::P_PIDFD,
-                pidfd.as_raw_fd() as u32,
+                pidfd.as_fd().as_raw_fd() as u32,
                 &mut siginfo,
                 libc::WEXITED | libc::WNOHANG,
             )
@@ -279,10 +286,10 @@ mod lowlevel {
         }
     }
 
-    fn pidfd_get_pid_fdinfo<Fd: AsRawFd>(pidfd: &Fd) -> io::Result<i32> {
+    fn pidfd_get_pid_fdinfo<Fd: AsFd>(pidfd: &Fd) -> io::Result<i32> {
         use std::fs::read_to_string;
 
-        let raw = pidfd.as_raw_fd();
+        let raw = pidfd.as_fd().as_raw_fd();
         let fdinfo = read_to_string(format!("/proc/self/fdinfo/{raw}"))?;
         let pidline = fdinfo
             .split('\n')
@@ -296,7 +303,7 @@ mod lowlevel {
             .map_err(|_| io::ErrorKind::Unsupported)?)
     }
 
-    pub fn pidfd_get_pid<Fd: AsRawFd>(pidfd: &Fd) -> io::Result<i32> {
+    pub fn pidfd_get_pid<Fd: AsFd>(pidfd: &Fd) -> io::Result<i32> {
         match pidfd_get_info(pidfd, PidfdInfoFlags::PID) {
             Ok(info) => Ok(info.pid as i32),
             Err(e) if e.kind() == io::ErrorKind::Unsupported => pidfd_get_pid_fdinfo(pidfd),
@@ -304,7 +311,7 @@ mod lowlevel {
         }
     }
 
-    pub fn pidfd_get_ppid<Fd: AsRawFd>(pidfd: &Fd) -> io::Result<i32> {
+    pub fn pidfd_get_ppid<Fd: AsFd>(pidfd: &Fd) -> io::Result<i32> {
         Ok(pidfd_get_info(pidfd, PidfdInfoFlags::PID).map(|info| info.ppid as i32)?)
     }
 
@@ -319,7 +326,7 @@ mod lowlevel {
         pub fsgid: u32,
     }
 
-    pub fn pidfd_get_creds<Fd: AsRawFd>(pidfd: &Fd) -> io::Result<PidfdCreds> {
+    pub fn pidfd_get_creds<Fd: AsFd>(pidfd: &Fd) -> io::Result<PidfdCreds> {
         Ok(
             pidfd_get_info(pidfd, PidfdInfoFlags::CREDS).map(|info| PidfdCreds {
                 ruid: info.ruid,
@@ -334,7 +341,7 @@ mod lowlevel {
         )
     }
 
-    pub fn pidfd_get_cgroupid<Fd: AsRawFd>(pidfd: &Fd) -> io::Result<u64> {
+    pub fn pidfd_get_cgroupid<Fd: AsFd>(pidfd: &Fd) -> io::Result<u64> {
         Ok(pidfd_get_info(pidfd, PidfdInfoFlags::PID).map(|info| info.cgroupid)?)
     }
 
@@ -361,7 +368,7 @@ mod lowlevel {
         }
     }
 
-    pub fn get_file_handle64<Fd: AsRawFd>(fd: &Fd) -> io::Result<u64> {
+    pub fn get_file_handle64<Fd: AsFd>(fd: &Fd) -> io::Result<u64> {
         #[repr(C)]
         struct file_handle {
             handle_bytes: u32,
@@ -385,7 +392,7 @@ mod lowlevel {
 
             let err = cvt(libc::syscall(
                 libc::SYS_name_to_handle_at,
-                fd.as_raw_fd() as libc::c_int,
+                fd.as_fd().as_raw_fd() as libc::c_int,
                 empty.as_ptr() as *mut libc::c_void,
                 &raw mut fh,
                 &raw mut mountfd,
@@ -416,7 +423,7 @@ mod lowlevel {
 
             let r = cvt(libc::syscall(
                 libc::SYS_name_to_handle_at,
-                fd.as_raw_fd() as libc::c_int,
+                fd.as_fd().as_raw_fd() as libc::c_int,
                 empty.as_ptr() as *mut libc::c_void,
                 buf.as_mut_ptr(),
                 &raw mut mountfd,
@@ -429,7 +436,6 @@ mod lowlevel {
         }
     }
 
-    // FIXME: do we want to aways take an AsFd instead of AsRawFd?
     pub fn pidfd_get_inode_id<Fd: AsFd>(pidfd: &Fd) -> io::Result<u64> {
         use nix::sys::stat::fstat;
 
