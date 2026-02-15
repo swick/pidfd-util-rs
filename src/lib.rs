@@ -9,14 +9,50 @@ use std::{io, process::ExitStatus};
 
 mod lowlevel {
     use nix::{ioctl_readwrite, request_code_none};
+    use std::any::Any;
     use std::io;
+    use std::ops::DerefMut;
     use std::os::fd::{FromRawFd, OwnedFd, RawFd, AsFd, AsRawFd};
     #[cfg(not(feature = "nightly"))]
     use std::os::unix::process::ExitStatusExt;
     #[cfg(not(feature = "nightly"))]
     use std::process::ExitStatus;
 
-    const PID_FS_MAGIC: u64 = 0x50494446;
+    const PID_FS_MAGIC: i64 = 0x50494446;
+
+
+    #[repr(u8)]
+    #[derive(PartialEq)]
+    enum Supported {
+        Unknown = 0,
+        Yes = 1,
+        No = 2,
+    }
+
+    struct AtomicSupported(std::sync::atomic::AtomicU8);
+
+    impl AtomicSupported {
+        const fn new(supported: Supported) -> Self {
+            Self(std::sync::atomic::AtomicU8::new(supported as u8))
+        }
+
+        fn load(&self) -> Supported {
+            match self.0.load(std::sync::atomic::Ordering::Relaxed) {
+                0 => Supported::Unknown,
+                1 => Supported::Yes,
+                2 => Supported::No,
+                _ => panic!(),
+            }
+        }
+
+        fn store(&self, supported: Supported) {
+            self.0.store(match supported {
+                Supported::Unknown => 0,
+                Supported::Yes => 1,
+                Supported::No => 2,
+            }, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 
     trait IsMinusOne {
         fn is_minus_one(&self) -> bool;
@@ -154,20 +190,14 @@ mod lowlevel {
     );
 
     // FIXME: don't leak nix dependency
-    fn pidfd_get_info<Fd: AsRawFd>(pidfd: &Fd, flags: u64) -> Result<PidfdInfo, nix::Error> {
-        use std::sync::atomic::AtomicU8;
-        use std::sync::atomic::Ordering;
-
+    fn pidfd_get_info<Fd: AsRawFd>(pidfd: &Fd, flags: u64) -> io::Result<PidfdInfo> {
         assert_eq!(64, std::mem::size_of::<PidfdInfo>());
 
-        static PIDFD_GET_INFO_SUPPORTED: AtomicU8 = AtomicU8::new(0);
-        const UNKNOWN: u8 = 0;
-        const YES: u8 = 1;
-        const NO: u8 = 2;
+        static SUPPORTED: AtomicSupported = AtomicSupported::new(Supported::Unknown);
 
-        let mut supported = PIDFD_GET_INFO_SUPPORTED.load(Ordering::Relaxed);
-        if supported == NO {
-            return Err(nix::Error::EOPNOTSUPP);
+        let supported = SUPPORTED.load();
+        if supported == Supported::No {
+            return Err(io::ErrorKind::Unsupported.into());
         }
 
         let mut info = PidfdInfo {
@@ -177,15 +207,14 @@ mod lowlevel {
 
         let r = unsafe { pidfd_get_info_ioctl(pidfd.as_raw_fd(), &mut info) }.map_err(ioctl_unsupported);
 
-        if supported == UNKNOWN {
-            match r {
-                Err(nix::Error::EOPNOTSUPP) => supported = NO,
-                _ => supported = YES,
+        if let Err(e) = r {
+            if e == nix::Error::EOPNOTSUPP {
+                SUPPORTED.store(Supported::No);
             }
-            PIDFD_GET_INFO_SUPPORTED.store(supported, Ordering::Relaxed);
+            return Err(io::Error::from_raw_os_error(e as i32));
+        } else if supported == Supported::Unknown {
+            SUPPORTED.store(Supported::Yes);
         }
-
-        r?;
 
         assert!(info.mask & flags == flags);
         Ok(info)
@@ -273,8 +302,8 @@ mod lowlevel {
     pub fn pidfd_get_pid<Fd: AsRawFd>(pidfd: &Fd) -> io::Result<i32> {
         match pidfd_get_info(pidfd, PidfdInfoFlags::PID) {
             Ok(info) => Ok(info.pid as i32),
-            Err(nix::Error::EOPNOTSUPP) => pidfd_get_pid_fdinfo(pidfd),
-            Err(e) => Err(e.into()),
+            Err(e) if e.kind() == io::ErrorKind::Unsupported => pidfd_get_pid_fdinfo(pidfd),
+            Err(e) => Err(e),
         }
     }
 
@@ -312,21 +341,119 @@ mod lowlevel {
         Ok(pidfd_get_info(pidfd, PidfdInfoFlags::PID).map(|info| info.cgroupid)?)
     }
 
+    pub fn pidfd_is_on_pidfs() -> io::Result<bool> {
+        use nix::sys::statfs::fstatfs;
+
+        static PIDFD_IS_ON_PIDFS: AtomicSupported = AtomicSupported::new(Supported::Unknown);
+
+        let supported = PIDFD_IS_ON_PIDFS.load();
+        match supported {
+            Supported::Unknown => (),
+            Supported::Yes => return Ok(true),
+            Supported::No => return Ok(false),
+        }
+
+        let self_pidfd = pidfd_open(std::process::id().try_into().unwrap())?;
+
+        let fsstat = fstatfs(self_pidfd)?;
+        if fsstat.filesystem_type().0 == PID_FS_MAGIC {
+            PIDFD_IS_ON_PIDFS.store(Supported::Yes);
+            return Ok(true);
+        } else {
+            PIDFD_IS_ON_PIDFS.store(Supported::No);
+            return Ok(false);
+        }
+    }
+
+    pub fn get_file_handle64<Fd: AsRawFd>(fd: &Fd) -> io::Result<u64> {
+        #[repr(C)]
+        struct file_handle {
+            handle_bytes: u32,
+            handle_type: libc::c_int,
+        }
+
+        static SUPPORTED: AtomicSupported = AtomicSupported::new(Supported::Unknown);
+
+        let supported = SUPPORTED.load();
+        if supported == Supported::No {
+            return Err(io::ErrorKind::Unsupported.into());
+        }
+
+        unsafe {
+            let mut mountfd: libc::c_int = 0;
+            let mut fh = file_handle {
+                handle_bytes: 0,
+                handle_type: 0,
+            };
+            let empty = "\0";
+
+            let err = cvt(libc::syscall(
+                libc::SYS_name_to_handle_at,
+                fd.as_raw_fd() as libc::c_int,
+                empty.as_ptr() as *mut libc::c_void,
+                &raw mut fh,
+                &raw mut mountfd,
+                libc::AT_EMPTY_PATH,
+            ) as libc::c_int).unwrap_err();
+
+            // FIXME: check all other instances of supported
+            // rename everything to SUPPORTED
+            if err.raw_os_error().unwrap() == libc::EOPNOTSUPP {
+                SUPPORTED.store(Supported::No);
+                return Err(io::ErrorKind::Unsupported.into());
+            } else if supported == Supported::Unknown {
+                SUPPORTED.store(Supported::Yes);
+            }
+
+            if err.raw_os_error().unwrap() != libc::EOVERFLOW || fh.handle_bytes <= 0 {
+                return Err(err);
+            }
+
+            let f_handle_size = fh.handle_bytes as usize;
+            if f_handle_size < 8 {
+                return Err(io::ErrorKind::Unsupported.into());
+            }
+
+            let mut buf = vec![0u8; std::mem::size_of::<file_handle>() + f_handle_size].into_boxed_slice();
+
+            let fh = buf.as_mut_ptr() as *mut file_handle;
+            (*fh).handle_type = 0;
+            (*fh).handle_bytes = f_handle_size as u32;
+
+            let r = cvt(libc::syscall(
+                libc::SYS_name_to_handle_at,
+                fd.as_raw_fd() as libc::c_int,
+                empty.as_ptr() as *mut libc::c_void,
+                buf.as_mut_ptr(),
+                &raw mut mountfd,
+                libc::AT_EMPTY_PATH,
+            ) as libc::c_int)?;
+            assert!(r == 0);
+
+            let fh = buf.as_ptr() as *const file_handle;
+            Ok((fh.add(1) as *const u64).read_unaligned())
+        }
+    }
+
+    // FIXME: do we want to aways take an AsFd instead of AsRawFd?
     pub fn pidfd_get_inode_id<Fd: AsFd>(pidfd: &Fd) -> io::Result<u64> {
         use nix::sys::stat::fstat;
-        use nix::sys::statvfs::fstatvfs;
-        // FIXME make sure pidfd is actually a pidfd (check_pidfs)
 
-        // TODO: look into name_to_handle_at
+        if !pidfd_is_on_pidfs()? {
+            return Err(io::ErrorKind::Unsupported.into());
+        }
 
-        let fsstat = fstatvfs(pidfd)?;
-        if fsstat.filesystem_id() == PID_FS_MAGIC {
-            return Err(io::Error::from(io::ErrorKind::Unsupported));
+        match get_file_handle64(&pidfd.as_fd()) {
+            Err(e) if e.kind() == io::ErrorKind::Unsupported => (),
+            r => return r,
         }
 
         let stat = fstat(pidfd)?;
-        // FIXME make into compile time
-        assert_eq!(8, std::mem::size_of_val(&stat.st_ino));
+
+        // stat.st_ino can be 4 bytes in 32 bit systems
+        if std::mem::size_of_val(&stat.st_ino) != 8 {
+            return Err(io::ErrorKind::Unsupported.into());
+        }
 
         Ok(stat.st_ino)
     }
