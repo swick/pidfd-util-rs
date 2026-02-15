@@ -12,6 +12,7 @@ mod lowlevel {
     use std::alloc::{Layout, alloc_zeroed, dealloc};
     use std::io;
     use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
+    use std::os::unix::ffi::OsStrExt;
     #[cfg(not(feature = "nightly"))]
     use std::os::unix::process::ExitStatusExt;
     #[cfg(not(feature = "nightly"))]
@@ -375,7 +376,20 @@ mod lowlevel {
         }
     }
 
-    pub fn get_file_handle64<Fd: AsFd>(fd: &Fd) -> io::Result<u64> {
+    pub struct FileHandle {
+        mount_id: i32,
+        handle_type: i32,
+        handle: Vec<u8>,
+    }
+
+    pub fn name_to_handle_at<Fd: AsFd>(
+        fd: &Fd,
+        path: &std::path::Path,
+        flags: i32,
+    ) -> io::Result<FileHandle> {
+        // FIXME: write safety comments
+        // FIXME: write tests
+
         #[repr(C)]
         #[derive(Default)]
         pub struct __IncompleteArrayField<T>(::std::marker::PhantomData<T>, [T; 0]);
@@ -397,17 +411,20 @@ mod lowlevel {
 
         let mut handle = file_handle::default();
         let mut mount_id = 0;
+        let mut path = path.as_os_str().as_bytes().to_owned();
+        path.push(0);
 
         let err = cvt(unsafe {
             libc::syscall(
                 libc::SYS_name_to_handle_at,
                 fd.as_fd().as_raw_fd() as libc::c_int,
-                &[0i8; 1] as *const libc::c_char,
+                path.as_ptr() as *const libc::c_char,
                 &raw mut handle as *mut file_handle,
                 &raw mut mount_id as *mut libc::c_int,
-                libc::AT_EMPTY_PATH,
+                flags,
             ) as libc::c_int
-        }).unwrap_err();
+        })
+        .unwrap_err();
 
         if err.raw_os_error().unwrap() == libc::EOPNOTSUPP {
             SUPPORTED.store(Supported::No);
@@ -419,44 +436,59 @@ mod lowlevel {
             return Err(err);
         }
 
-        let layout = Layout::new::<file_handle>();
-        let buf_layout = Layout::array::<libc::c_uchar>(handle.handle_bytes.try_into().unwrap()).unwrap();
-        let (layout, buf_offset) = layout.extend(buf_layout).unwrap();
-        let layout = layout.pad_to_align();
+        loop {
+            let layout = Layout::new::<file_handle>();
+            let buf_layout =
+                Layout::array::<libc::c_uchar>(handle.handle_bytes.try_into().unwrap()).unwrap();
+            let (layout, buf_offset) = layout.extend(buf_layout).unwrap();
+            let layout = layout.pad_to_align();
 
-        let buf = unsafe { alloc_zeroed(layout) };
-        let mut new_handle: Box<file_handle> = unsafe { Box::from_raw(buf as _) };
-        new_handle.handle_bytes = handle.handle_bytes;
-        new_handle.handle_type = handle.handle_type;
+            let buf = unsafe { alloc_zeroed(layout) };
+            let mut new_handle: Box<file_handle> = unsafe { Box::from_raw(buf as _) };
+            new_handle.handle_bytes = handle.handle_bytes;
+            new_handle.handle_type = handle.handle_type;
 
-        let res = cvt(unsafe {
-            libc::syscall(
-                libc::SYS_name_to_handle_at,
-                fd.as_fd().as_raw_fd() as libc::c_int,
-                &[0i8; 1] as *const libc::c_char,
-                &raw mut *new_handle as *mut file_handle,
-                &raw mut mount_id as *mut libc::c_int,
-                libc::AT_EMPTY_PATH,
-            ) as libc::c_int
-        });
+            let res = cvt(unsafe {
+                libc::syscall(
+                    libc::SYS_name_to_handle_at,
+                    fd.as_fd().as_raw_fd() as libc::c_int,
+                    path.as_ptr() as *const libc::c_char,
+                    &raw mut *new_handle as *mut file_handle,
+                    &raw mut mount_id as *mut libc::c_int,
+                    flags,
+                ) as libc::c_int
+            });
 
-        let handle_bytes = new_handle.handle_bytes.try_into().unwrap();
-        Box::leak(new_handle);
+            handle.handle_bytes = new_handle.handle_bytes;
+            handle.handle_type = new_handle.handle_type;
+            Box::leak(new_handle);
 
-        if let Err(e) = res {
-            unsafe { dealloc(buf, layout) };
-            return Err(e);
+            match res {
+                Err(e) if e.raw_os_error().unwrap() == libc::EOVERFLOW => (),
+                Err(e) => {
+                    unsafe { dealloc(buf, layout) };
+                    return Err(e);
+                }
+                Ok(_) => {
+                    let f_handle = unsafe {
+                        std::slice::from_raw_parts(
+                            buf.offset(buf_offset.try_into().unwrap()),
+                            handle.handle_bytes.try_into().unwrap(),
+                        )
+                    };
+
+                    let h = FileHandle {
+                        mount_id: mount_id,
+                        handle_type: handle.handle_type,
+                        handle: f_handle.to_vec(),
+                    };
+
+                    unsafe { dealloc(buf, layout) };
+
+                    return Ok(h);
+                }
+            }
         }
-
-        let f_handle = unsafe {
-            std::slice::from_raw_parts(buf.offset(buf_offset.try_into().unwrap()), handle_bytes)
-        };
-
-        let h64 = u64::from_ne_bytes(f_handle.try_into().unwrap());
-
-        unsafe { dealloc(buf, layout) };
-
-        Ok(h64)
     }
 
     pub fn pidfd_get_inode_id<Fd: AsFd>(pidfd: &Fd) -> io::Result<u64> {
@@ -466,9 +498,14 @@ mod lowlevel {
             return Err(io::ErrorKind::Unsupported.into());
         }
 
-        match get_file_handle64(&pidfd.as_fd()) {
+        match name_to_handle_at(
+            &pidfd.as_fd(),
+            std::path::Path::new(""),
+            libc::AT_EMPTY_PATH,
+        ) {
             Err(e) if e.kind() == io::ErrorKind::Unsupported => (),
-            r => return r,
+            Err(e) => return Err(e),
+            Ok(h) => return Ok(u64::from_ne_bytes(h.handle.try_into().unwrap())),
         }
 
         let stat = fstat(pidfd)?;
