@@ -10,7 +10,7 @@ use std::{io, process::ExitStatus};
 mod lowlevel {
     use nix;
     use std::io;
-    use std::os::fd::{FromRawFd, OwnedFd, RawFd, AsFd, AsRawFd};
+    use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
     #[cfg(not(feature = "nightly"))]
     use std::os::unix::process::ExitStatusExt;
     #[cfg(not(feature = "nightly"))]
@@ -44,11 +44,14 @@ mod lowlevel {
         }
 
         fn store(&self, supported: Supported) {
-            self.0.store(match supported {
-                Supported::Unknown => 0,
-                Supported::Yes => 1,
-                Supported::No => 2,
-            }, atomic::Ordering::Relaxed);
+            self.0.store(
+                match supported {
+                    Supported::Unknown => 0,
+                    Supported::Yes => 1,
+                    Supported::No => 2,
+                },
+                atomic::Ordering::Relaxed,
+            );
         }
     }
 
@@ -134,7 +137,10 @@ mod lowlevel {
         }
     }
 
-    pub fn pidfd_get_namespace<Fd: AsFd>(pidfd: &Fd, ns: &PidfdGetNamespace) -> io::Result<OwnedFd> {
+    pub fn pidfd_get_namespace<Fd: AsFd>(
+        pidfd: &Fd,
+        ns: &PidfdGetNamespace,
+    ) -> io::Result<OwnedFd> {
         unsafe {
             let fd = cvt(libc::ioctl(
                 pidfd.as_fd().as_raw_fd(),
@@ -202,7 +208,8 @@ mod lowlevel {
             ..Default::default()
         };
 
-        let r = unsafe { pidfd_get_info_ioctl(pidfd.as_fd().as_raw_fd(), &mut info) }.map_err(ioctl_unsupported);
+        let r = unsafe { pidfd_get_info_ioctl(pidfd.as_fd().as_raw_fd(), &mut info) }
+            .map_err(ioctl_unsupported);
 
         if let Err(e) = r {
             if e == nix::Error::EOPNOTSUPP {
@@ -397,7 +404,8 @@ mod lowlevel {
                 &raw mut fh,
                 &raw mut mountfd,
                 libc::AT_EMPTY_PATH,
-            ) as libc::c_int).unwrap_err();
+            ) as libc::c_int)
+            .unwrap_err();
 
             if err.raw_os_error().unwrap() == libc::EOPNOTSUPP {
                 SUPPORTED.store(Supported::No);
@@ -415,7 +423,8 @@ mod lowlevel {
                 return Err(io::ErrorKind::Unsupported.into());
             }
 
-            let mut buf = vec![0u8; std::mem::size_of::<file_handle>() + f_handle_size].into_boxed_slice();
+            let mut buf =
+                vec![0u8; std::mem::size_of::<file_handle>() + f_handle_size].into_boxed_slice();
 
             let fh = buf.as_mut_ptr() as *mut file_handle;
             (*fh).handle_type = 0;
