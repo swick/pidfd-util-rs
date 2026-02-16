@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: 2026 The pidfd-util-rs authors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "pidfd-util"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+nightly = []
+
+[dependencies]
+libc = { version = "0.2" }
+async-io = { version = "2" }
+nix = { version = "0.31", features = [
+    "ioctl",
+    "fs",
+    "sched",
+    "user", # FIXME: only for tests
+] }
+
+[dev-dependencies]
+futures-lite = "2.0"
