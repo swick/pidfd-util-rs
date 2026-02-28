@@ -4,11 +4,9 @@
 #![cfg_attr(feature = "nightly", feature(linux_pidfd))]
 
 /*
- * FIXME: add safety comments
  * FIXME: use miri
  * FIXME: split out name_to_handle_at into new crate
  */
-use std::{io, process::ExitStatus};
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
@@ -16,6 +14,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 #[cfg(not(feature = "nightly"))]
 use std::sync::atomic;
+use std::{io, process::ExitStatus};
 
 const PID_FS_MAGIC: i64 = 0x50494446;
 
@@ -128,10 +127,13 @@ impl PidfdGetNamespace {
     }
 }
 
-pub fn pidfd_get_namespace<Fd: AsFd>(
-    pidfd: &Fd,
-    ns: &PidfdGetNamespace,
-) -> io::Result<OwnedFd> {
+pub fn pidfd_get_namespace<Fd: AsFd>(pidfd: &Fd, ns: &PidfdGetNamespace) -> io::Result<OwnedFd> {
+    // SAFETY:
+    // The arguments of the ioctl depend on the ioctl number and the fd.
+    // The fd wrapped in a Pidfd is always a pidfd fd.
+    // The ioctl number is guarantteed to be as implemented by PidfdGetNamespace::as_ioctl.
+    // All those ioctl numbers have the same scheme and do not take any other argument.
+    // The result is either -1 with errno, or a valid fd.
     unsafe {
         let fd = cvt(libc::ioctl(
             pidfd.as_fd().as_raw_fd(),
@@ -199,7 +201,11 @@ fn pidfd_get_info<Fd: AsFd>(pidfd: &Fd, flags: u64) -> io::Result<PidfdInfo> {
         ..Default::default()
     };
 
-    let r = unsafe { pidfd_get_info_ioctl(pidfd.as_fd().as_raw_fd(), &mut info) }
+    // SAFETY:
+    // nix::ioctl_readwrite defines pidfd_get_info_ioctl.
+    // The fd wrapped in a Pidfd is always a pidfd fd.
+    // The GET_INFO ioctl takes a `struct pidfd_info` as argument, which is mirrored in `struct PidfdInfo`.
+    let r = unsafe { pidfd_get_info_ioctl(pidfd.as_fd().as_raw_fd(), &raw mut info) }
         .map_err(ioctl_unsupported);
 
     if let Err(e) = r {
@@ -216,20 +222,34 @@ fn pidfd_get_info<Fd: AsFd>(pidfd: &Fd, flags: u64) -> io::Result<PidfdInfo> {
 }
 
 pub fn pidfd_open(pid: libc::pid_t) -> io::Result<OwnedFd> {
+    // SAFETY:
+    // The pidfd_open syscall takes arguments which are mirrored here.
+    // The syscall handles arbitrary values of pid.
+    // The other arguments are static and valid.
+    // The result is either -1 with errno, or a valid fd.
     unsafe {
-        let fd = cvt(libc::syscall(libc::SYS_pidfd_open, pid, 0))?;
+        let fd = cvt(libc::syscall(
+            libc::SYS_pidfd_open,
+            pid as libc::pid_t,
+            0 as libc::c_uint,
+        ))?;
         Ok(OwnedFd::from_raw_fd(fd as libc::c_int))
     }
 }
 
 pub fn pidfd_send_signal<Fd: AsFd>(pidfd: &Fd, signal: libc::c_int) -> io::Result<()> {
+    // SAFETY:
+    // The pidfd_send_signal syscall takes arguments which are mirrored here.
+    // The fd wrapped in a Pidfd is always a pidfd fd.
+    // The syscall handles arbitrary values of signal.
+    // The other arguments are static and valid.
     cvt(unsafe {
         libc::syscall(
             libc::SYS_pidfd_send_signal,
-            pidfd.as_fd().as_raw_fd(),
-            signal,
-            std::ptr::null::<()>(),
-            0,
+            pidfd.as_fd().as_raw_fd() as libc::c_int,
+            signal as libc::c_int,
+            std::ptr::null::<()>() as *const libc::siginfo_t,
+            0 as libc::c_uint,
         )
     })
     .map(drop)
@@ -237,6 +257,8 @@ pub fn pidfd_send_signal<Fd: AsFd>(pidfd: &Fd, signal: libc::c_int) -> io::Resul
 
 #[cfg(not(feature = "nightly"))]
 fn from_waitid_siginfo(siginfo: libc::siginfo_t) -> ExitStatus {
+    // SAFETY:
+    // FIXME
     let status = unsafe { siginfo.si_status() };
 
     match siginfo.si_code {
@@ -253,12 +275,21 @@ fn from_waitid_siginfo(siginfo: libc::siginfo_t) -> ExitStatus {
 
 #[cfg(not(feature = "nightly"))]
 pub fn pidfd_wait<Fd: AsFd>(pidfd: &Fd) -> io::Result<ExitStatus> {
+    // SAFETY:
+    // FIXME I think all-zero byte-pattern is valid for libc::siginfo_t
     let mut siginfo: libc::siginfo_t = unsafe { std::mem::zeroed() };
+
+    // SAFETY:
+    // FIXME not entirely sure what the safeye guarantees should be here, but...
+    // The libc::P_PIDFD constant tells means the second param must be a pidfd fd.
+    // The fd wrapped in a Pidfd is always a pidfd fd.
+    // The siginfo parameter is a zeroed struct which will be filled by the syscall.
+    // WEXITED is a valid constant for the last parameter.
     cvt(unsafe {
         libc::waitid(
             libc::P_PIDFD,
             pidfd.as_fd().as_raw_fd() as u32,
-            &mut siginfo,
+            &raw mut siginfo,
             libc::WEXITED,
         )
     })?;
@@ -267,8 +298,16 @@ pub fn pidfd_wait<Fd: AsFd>(pidfd: &Fd) -> io::Result<ExitStatus> {
 
 #[cfg(not(feature = "nightly"))]
 pub fn pidfd_try_wait<Fd: AsFd>(pidfd: &Fd) -> io::Result<Option<ExitStatus>> {
+    // SAFETY:
+    // FIXME I think all-zero byte-pattern is valid for libc::siginfo_t
     let mut siginfo: libc::siginfo_t = unsafe { std::mem::zeroed() };
 
+    // SAFETY:
+    // FIXME not entirely sure what the safeye guarantees should be here, but...
+    // The libc::P_PIDFD constant tells means the second param must be a pidfd fd.
+    // The fd wrapped in a Pidfd is always a pidfd fd.
+    // The siginfo parameter is a zeroed struct which will be filled by the syscall.
+    // WEXITED|WNOHANG is a valid constant for the last parameter.
     cvt(unsafe {
         libc::waitid(
             libc::P_PIDFD,
@@ -277,6 +316,9 @@ pub fn pidfd_try_wait<Fd: AsFd>(pidfd: &Fd) -> io::Result<Option<ExitStatus>> {
             libc::WEXITED | libc::WNOHANG,
         )
     })?;
+
+    // SAFETY:
+    // The siginfo parameter was a zeroed struct which we made sure got successfully filled by the syscall.
     if unsafe { siginfo.si_pid() } == 0 {
         Ok(None)
     } else {
@@ -400,6 +442,13 @@ pub fn name_to_handle_at<Fd: AsFd>(
     let mut path = path.as_os_str().as_bytes().to_owned();
     path.push(0);
 
+    // SAFETY:
+    // The name_to_handle_at syscall takes arguments which are mirrored here.
+    // The fd wrapped in a Pidfd is always a pidfd fd.
+    // The path is a valid, empty, zero-terminated path.
+    // The handle mirrors `struct file_handle` and is zero-initialized, this means file_handle.handle_bytes is also zero, so the allocated size for handle is correct.
+    // The mount_id is a valid pointer to an int.
+    // The syscall handles arbitrary values of flags.
     #[allow(clippy::unnecessary_cast)]
     let err = cvt(unsafe {
         libc::syscall(
@@ -430,11 +479,19 @@ pub fn name_to_handle_at<Fd: AsFd>(
         let (layout, buf_offset) = layout.extend(buf_layout).unwrap();
         let layout = layout.pad_to_align();
 
+        // SAFETY:
+        // Layout has non-zero size because file_handle has non-zero size
         let buf = unsafe { alloc_zeroed(layout) };
+        // SAFETY:
+        // Constructing a Box from the newly allocated, zeroed memory is valid
         let mut new_handle: Box<file_handle> = unsafe { Box::from_raw(buf as _) };
         new_handle.handle_bytes = handle.handle_bytes;
         new_handle.handle_type = handle.handle_type;
 
+        // SAFETY:
+        // Same as the previous name_to_handle_at syscall, except...
+        // new_handle.handle_bytes is bigger than zero, so the memory allocated for new_handle must be bigger by that amount.
+        // The code above ensures we allocated the right size.
         #[allow(clippy::unnecessary_cast)]
         let res = cvt(unsafe {
             libc::syscall(
@@ -449,28 +506,40 @@ pub fn name_to_handle_at<Fd: AsFd>(
 
         handle.handle_bytes = new_handle.handle_bytes;
         handle.handle_type = new_handle.handle_type;
+        // We leak this because the memory belongs to buf
         Box::leak(new_handle);
 
         match res {
             Err(e) if e.raw_os_error().unwrap() == libc::EOVERFLOW => (),
             Err(e) => {
+                // SAFETY:
+                // buf and layout are still valid, and we must deallocate the memory to avoid memory leaks
                 unsafe { dealloc(buf, layout) };
                 return Err(e);
             }
             Ok(_) => {
-                let f_handle = unsafe {
-                    std::slice::from_raw_parts(
-                        buf.offset(buf_offset.try_into().unwrap()),
-                        handle.handle_bytes.try_into().unwrap(),
-                    )
+                let h = {
+                    // SAFETY:
+                    // buf_offset was created from the layout to point at the char[].
+                    // We allocated enough size for handle_bytes via the layout.
+                    // The [u8] is thus properly aligned and non-zero.
+                    // f_handle goes out of scope before we deallocate.
+                    let f_handle = unsafe {
+                        std::slice::from_raw_parts(
+                            buf.offset(buf_offset.try_into().unwrap()),
+                            handle.handle_bytes.try_into().unwrap(),
+                        )
+                    };
+
+                    FileHandle {
+                        mount_id,
+                        handle_type: handle.handle_type,
+                        handle: f_handle.to_vec(),
+                    }
                 };
 
-                let h = FileHandle {
-                    mount_id,
-                    handle_type: handle.handle_type,
-                    handle: f_handle.to_vec(),
-                };
-
+                // SAFETY:
+                // buf and layout are still valid, and we must deallocate the memory to avoid memory leaks
                 unsafe { dealloc(buf, layout) };
 
                 return Ok(h);
@@ -507,12 +576,18 @@ pub fn pidfd_get_inode_id<Fd: AsFd>(pidfd: &Fd) -> io::Result<u64> {
 }
 
 pub fn pidfd_getfd<Fd: AsFd>(pidfd: &Fd, targetfd: i32) -> io::Result<OwnedFd> {
+    // SAFETY:
+    // The pidfd_getfd syscall takes arguments which are mirrored here.
+    // The fd wrapped in a Pidfd is always a pidfd fd.
+    // The syscall handles arbitrary values of targetfd.
+    // The other arguments are static and valid.
+    // The result is either -1 with errno, or a valid fd.
     unsafe {
         let fd = cvt(libc::syscall(
             libc::SYS_pidfd_getfd,
             pidfd.as_fd().as_raw_fd() as libc::c_int,
             targetfd as libc::c_int,
-            0,
+            0 as libc::c_uint,
         ) as libc::c_int)?;
         Ok(OwnedFd::from_raw_fd(fd as libc::c_int))
     }

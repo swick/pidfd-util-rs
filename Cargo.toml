@@ -22,3 +22,6 @@ nix = { version = "0.31", features = [
 
 [dev-dependencies]
 futures-lite = "2.0"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

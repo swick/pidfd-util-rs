@@ -47,6 +47,8 @@ mod pidfd_impl {
 
     impl FromRawFd for PidFd {
         unsafe fn from_raw_fd(fd: RawFd) -> Self {
+            // SAFETY:
+            // The caller must ensure that fd is a valid Pidfd.
             unsafe { Self(OwnedFd::from_raw_fd(fd)) }
         }
     }
