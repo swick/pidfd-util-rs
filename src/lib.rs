@@ -8,9 +8,16 @@
 
 mod lowlevel;
 
-use async_io::Async;
-use std::os::fd::OwnedFd;
-use std::{io, process::ExitStatus};
+#[cfg(feature = "async")]
+pub use pidfd_async::AsyncPidFd;
+
+#[cfg(not(feature = "nightly"))]
+pub use pidfd_impl::*;
+#[cfg(feature = "nightly")]
+pub use std::os::linux::process::PidFd;
+
+pub use pidfd_ext::PidFdExt;
+pub use lowlevel::{PidfdCreds, PidfdGetNamespace};
 
 #[cfg(not(feature = "nightly"))]
 mod pidfd_impl {
@@ -75,116 +82,124 @@ mod pidfd_impl {
     }
 }
 
-#[cfg(not(feature = "nightly"))]
-pub use pidfd_impl::*;
-#[cfg(feature = "nightly")]
-pub use std::os::linux::process::PidFd;
+mod pidfd_ext {
+    use std::io;
+    use std::os::fd::OwnedFd;
+    use super::PidFd;
+    use super::lowlevel::{PidfdCreds, PidfdGetNamespace};
+    use super::lowlevel::{
+        pidfd_get_cgroupid, pidfd_get_creds, pidfd_get_inode_id, pidfd_get_namespace, pidfd_get_pid,
+        pidfd_get_ppid, pidfd_getfd, pidfd_open, pidfd_send_signal,
+    };
+    pub use nix::sched::CloneFlags;
 
-pub use lowlevel::{PidfdCreds, PidfdGetNamespace};
-use lowlevel::{
-    pidfd_get_cgroupid, pidfd_get_creds, pidfd_get_inode_id, pidfd_get_namespace, pidfd_get_pid,
-    pidfd_get_ppid, pidfd_getfd, pidfd_open, pidfd_send_signal,
-};
-pub use nix::sched::CloneFlags;
+    pub trait PidFdExt {
+        fn from_self() -> io::Result<PidFd>;
 
-pub trait PidFdExt {
-    fn from_self() -> io::Result<PidFd>;
+        fn from_pid(pid: i32) -> io::Result<PidFd>;
 
-    fn from_pid(pid: i32) -> io::Result<PidFd>;
+        fn get_pid(&self) -> io::Result<i32>;
 
-    fn get_pid(&self) -> io::Result<i32>;
+        fn get_ppid(&self) -> io::Result<i32>;
 
-    fn get_ppid(&self) -> io::Result<i32>;
+        fn get_id(&self) -> io::Result<u64>;
 
-    fn get_id(&self) -> io::Result<u64>;
+        fn get_creds(&self) -> io::Result<PidfdCreds>;
 
-    fn get_creds(&self) -> io::Result<PidfdCreds>;
+        fn get_cgroupid(&self) -> io::Result<u64>;
 
-    fn get_cgroupid(&self) -> io::Result<u64>;
+        fn get_namespace(&self, ns: &PidfdGetNamespace) -> io::Result<OwnedFd>;
 
-    fn get_namespace(&self, ns: &PidfdGetNamespace) -> io::Result<OwnedFd>;
+        fn access_proc<R, F: FnOnce() -> R>(&self, func: F) -> io::Result<R>;
 
-    fn access_proc<R, F: FnOnce() -> R>(&self, func: F) -> io::Result<R>;
+        fn send_signal(&self, signal: i32) -> io::Result<()>;
 
-    fn send_signal(&self, signal: i32) -> io::Result<()>;
+        fn set_namespace(&self, ns: CloneFlags) -> io::Result<()>;
 
-    fn set_namespace(&self, ns: CloneFlags) -> io::Result<()>;
-
-    fn get_remote_fd(&self, target_fd: i32) -> io::Result<OwnedFd>;
-}
-
-impl PidFdExt for PidFd {
-    fn from_self() -> io::Result<PidFd> {
-        Self::from_pid(std::process::id().try_into().unwrap())
+        fn get_remote_fd(&self, target_fd: i32) -> io::Result<OwnedFd>;
     }
 
-    fn from_pid(pid: i32) -> io::Result<PidFd> {
-        pidfd_open(pid as libc::pid_t).map(PidFd::from)
-    }
-
-    fn get_pid(&self) -> io::Result<i32> {
-        pidfd_get_pid(self)
-    }
-
-    fn get_ppid(&self) -> io::Result<i32> {
-        pidfd_get_ppid(self)
-    }
-
-    fn get_id(&self) -> io::Result<u64> {
-        pidfd_get_inode_id(self)
-    }
-
-    fn get_creds(&self) -> io::Result<PidfdCreds> {
-        pidfd_get_creds(self)
-    }
-
-    fn get_cgroupid(&self) -> io::Result<u64> {
-        pidfd_get_cgroupid(self)
-    }
-
-    fn get_namespace(&self, ns: &PidfdGetNamespace) -> io::Result<OwnedFd> {
-        pidfd_get_namespace(self, ns)
-    }
-
-    fn access_proc<R, F: FnOnce() -> R>(&self, func: F) -> io::Result<R> {
-        let pid = self.get_pid()?;
-        let result = func();
-        let pid_after = self.get_pid()?;
-
-        if pid != pid_after {
-            return Err(io::ErrorKind::NotFound.into());
+    impl PidFdExt for PidFd {
+        fn from_self() -> io::Result<PidFd> {
+            Self::from_pid(std::process::id().try_into().unwrap())
         }
 
-        Ok(result)
-    }
+        fn from_pid(pid: i32) -> io::Result<PidFd> {
+            pidfd_open(pid as libc::pid_t).map(PidFd::from)
+        }
 
-    fn send_signal(&self, signal: i32) -> io::Result<()> {
-        pidfd_send_signal(self, signal)
-    }
+        fn get_pid(&self) -> io::Result<i32> {
+            pidfd_get_pid(self)
+        }
 
-    fn set_namespace(&self, ns: CloneFlags) -> io::Result<()> {
-        Ok(nix::sched::setns(self, ns)?)
-    }
+        fn get_ppid(&self) -> io::Result<i32> {
+            pidfd_get_ppid(self)
+        }
 
-    fn get_remote_fd(&self, target_fd: i32) -> io::Result<OwnedFd> {
-        pidfd_getfd(self, target_fd)
+        fn get_id(&self) -> io::Result<u64> {
+            pidfd_get_inode_id(self)
+        }
+
+        fn get_creds(&self) -> io::Result<PidfdCreds> {
+            pidfd_get_creds(self)
+        }
+
+        fn get_cgroupid(&self) -> io::Result<u64> {
+            pidfd_get_cgroupid(self)
+        }
+
+        fn get_namespace(&self, ns: &PidfdGetNamespace) -> io::Result<OwnedFd> {
+            pidfd_get_namespace(self, ns)
+        }
+
+        fn access_proc<R, F: FnOnce() -> R>(&self, func: F) -> io::Result<R> {
+            let pid = self.get_pid()?;
+            let result = func();
+            let pid_after = self.get_pid()?;
+
+            if pid != pid_after {
+                return Err(io::ErrorKind::NotFound.into());
+            }
+
+            Ok(result)
+        }
+
+        fn send_signal(&self, signal: i32) -> io::Result<()> {
+            pidfd_send_signal(self, signal)
+        }
+
+        fn set_namespace(&self, ns: CloneFlags) -> io::Result<()> {
+            Ok(nix::sched::setns(self, ns)?)
+        }
+
+        fn get_remote_fd(&self, target_fd: i32) -> io::Result<OwnedFd> {
+            pidfd_getfd(self, target_fd)
+        }
     }
 }
 
-impl TryFrom<PidFd> for AsyncPidFd {
-    type Error = io::Error;
+#[cfg(feature = "async")]
+mod pidfd_async {
+    use super::PidFd;
+    use std::io;
+    use async_io::Async;
+    use std::process::ExitStatus;
 
-    fn try_from(pifd: PidFd) -> Result<Self, io::Error> {
-        Ok(Self(Async::new(pifd)?))
+    impl TryFrom<PidFd> for AsyncPidFd {
+        type Error = io::Error;
+
+        fn try_from(pifd: PidFd) -> Result<Self, io::Error> {
+            Ok(Self(Async::new(pifd)?))
+        }
     }
-}
 
-pub struct AsyncPidFd(Async<PidFd>);
+    pub struct AsyncPidFd(Async<PidFd>);
 
-impl AsyncPidFd {
-    pub async fn wait(&self) -> io::Result<ExitStatus> {
-        self.0.readable().await?;
-        self.0.get_ref().wait()
+    impl AsyncPidFd {
+        pub async fn wait(&self) -> io::Result<ExitStatus> {
+            self.0.readable().await?;
+            self.0.get_ref().wait()
+        }
     }
 }
 
@@ -234,6 +249,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "async")]
     async fn async_spawn_and_status(cmd: &mut Command) -> io::Result<ExitStatus> {
         let child = cmd.spawn()?;
         let pidfd: AsyncPidFd = PidFd::from_pid(child.id().try_into().unwrap())?.try_into()?;
@@ -241,6 +257,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "async")]
     fn test_async() -> io::Result<()> {
         use futures_lite::future;
         future::block_on(async {
@@ -256,6 +273,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "async")]
     fn test_async_concurrent() -> std::io::Result<()> {
         use futures_lite::future::{self, FutureExt};
         future::block_on(async {
@@ -273,6 +291,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "async")]
     fn test_async_wait_twice() -> std::io::Result<()> {
         futures_lite::future::block_on(async {
             let child = Command::new("/bin/true").spawn()?;

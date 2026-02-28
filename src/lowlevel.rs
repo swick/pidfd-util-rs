@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: 2026 The pidfd-util-rs authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-#![cfg_attr(feature = "nightly", feature(linux_pidfd))]
-
 // TODO:
 // - split out name_to_handle_at into new crate
 
