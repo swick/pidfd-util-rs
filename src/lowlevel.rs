@@ -3,10 +3,9 @@
 
 #![cfg_attr(feature = "nightly", feature(linux_pidfd))]
 
-/*
- * FIXME: use miri
- * FIXME: split out name_to_handle_at into new crate
- */
+// TODO:
+// - split out name_to_handle_at into new crate
+
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;

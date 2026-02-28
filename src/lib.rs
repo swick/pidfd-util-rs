@@ -1,11 +1,8 @@
 // SPDX-FileCopyrightText: 2026 The pidfd-util-rs authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-/*
- * FIXME: make async a feature
- * FIXME: use cargo-msrv to find minimum versions of deps
- * FIXME: add docs
- */
+// FIXME: make async a feature
+// FIXME: add docs
 
 #![cfg_attr(feature = "nightly", feature(linux_pidfd))]
 
