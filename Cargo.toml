@@ -5,6 +5,7 @@
 name = "pidfd-util"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 
 [features]
 default = ["async"]
