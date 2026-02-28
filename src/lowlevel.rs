@@ -94,16 +94,43 @@ const PIDFS_IOCTL_GET_USER_NAMESPACE: u8 = 9;
 const PIDFS_IOCTL_GET_UTS_NAMESPACE: u8 = 10;
 const PIDFS_IOCTL_GET_INFO: u8 = 11;
 
+/// Linux namespace types that can be queried from a pidfd.
+///
+/// Used with [`PidFdExt::get_namespace`](crate::PidFdExt::get_namespace) to obtain
+/// a file descriptor to a specific namespace of a process.
+///
+/// # Examples
+///
+/// ```no_run
+/// use pidfd_util::{PidFd, PidFdExt, PidfdGetNamespace};
+///
+/// # fn main() -> std::io::Result<()> {
+/// let pidfd = PidFd::from_pid(1234)?;
+/// let netns = pidfd.get_namespace(&PidfdGetNamespace::Net)?;
+/// # Ok(())
+/// # }
+/// ```
+#[non_exhaustive]
 pub enum PidfdGetNamespace {
+    /// Control group namespace
     Cgroup,
+    /// IPC namespace (System V IPC, POSIX message queues)
     Ipc,
+    /// Mount namespace (filesystem mount points)
     Mnt,
+    /// Network namespace (network devices, stacks, ports, etc.)
     Net,
+    /// PID namespace
     Pid,
+    /// PID namespace for child processes
     PidForChildren,
+    /// Time namespace
     Time,
+    /// Time namespace for child processes
     TimeForChildren,
+    /// User namespace (user and group IDs)
     User,
+    /// UTS namespace (hostname and NIS domain name)
     Uts,
 }
 
@@ -352,14 +379,40 @@ pub fn pidfd_get_ppid<Fd: AsFd>(pidfd: &Fd) -> io::Result<i32> {
     pidfd_get_info(pidfd, PidfdInfoFlags::PID).map(|info| info.ppid as i32)
 }
 
+/// Process credential information.
+///
+/// Contains the various user and group IDs associated with a process.
+/// Obtained via [`PidFdExt::get_creds`](crate::PidFdExt::get_creds).
+///
+/// # Examples
+///
+/// ```no_run
+/// use pidfd_util::{PidFd, PidFdExt};
+///
+/// # fn main() -> std::io::Result<()> {
+/// let pidfd = PidFd::from_self()?;
+/// let creds = pidfd.get_creds()?;
+/// println!("Running as UID {} (effective: {})", creds.ruid, creds.euid);
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PidfdCreds {
+    /// Real user ID
     pub ruid: u32,
+    /// Real group ID
     pub rgid: u32,
+    /// Effective user ID (used for permission checks)
     pub euid: u32,
+    /// Effective group ID (used for permission checks)
     pub egid: u32,
+    /// Saved user ID
     pub suid: u32,
+    /// Saved group ID
     pub sgid: u32,
+    /// Filesystem user ID (used for filesystem operations)
     pub fsuid: u32,
+    /// Filesystem group ID (used for filesystem operations)
     pub fsgid: u32,
 }
 
