@@ -98,20 +98,8 @@ const PIDFS_IOCTL_GET_INFO: u8 = 11;
 ///
 /// Used with [`PidFdExt::get_namespace`](crate::PidFdExt::get_namespace) to obtain
 /// a file descriptor to a specific namespace of a process.
-///
-/// # Examples
-///
-/// ```no_run
-/// use pidfd_util::{PidFd, PidFdExt, PidfdGetNamespace};
-///
-/// # fn main() -> std::io::Result<()> {
-/// let pidfd = PidFd::from_pid(1234)?;
-/// let netns = pidfd.get_namespace(&PidfdGetNamespace::Net)?;
-/// # Ok(())
-/// # }
-/// ```
 #[non_exhaustive]
-pub enum PidfdGetNamespace {
+pub enum PidFdGetNamespace {
     /// Control group namespace
     Cgroup,
     /// IPC namespace (System V IPC, POSIX message queues)
@@ -134,28 +122,28 @@ pub enum PidfdGetNamespace {
     Uts,
 }
 
-impl PidfdGetNamespace {
+impl PidFdGetNamespace {
     fn as_ioctl(&self) -> u8 {
         match self {
-            PidfdGetNamespace::Cgroup => PIDFS_IOCTL_GET_CGROUP_NAMESPACE,
-            PidfdGetNamespace::Ipc => PIDFS_IOCTL_GET_IPC_NAMESPACE,
-            PidfdGetNamespace::Mnt => PIDFS_IOCTL_GET_MNT_NAMESPACE,
-            PidfdGetNamespace::Net => PIDFS_IOCTL_GET_NET_NAMESPACE,
-            PidfdGetNamespace::Pid => PIDFS_IOCTL_GET_PID_NAMESPACE,
-            PidfdGetNamespace::PidForChildren => PIDFS_IOCTL_GET_PID_FOR_CHILDREN_NAMESPACE,
-            PidfdGetNamespace::Time => PIDFS_IOCTL_GET_TIME_NAMESPACE,
-            PidfdGetNamespace::TimeForChildren => PIDFS_IOCTL_GET_TIME_FOR_CHILDREN_NAMESPACE,
-            PidfdGetNamespace::User => PIDFS_IOCTL_GET_USER_NAMESPACE,
-            PidfdGetNamespace::Uts => PIDFS_IOCTL_GET_UTS_NAMESPACE,
+            PidFdGetNamespace::Cgroup => PIDFS_IOCTL_GET_CGROUP_NAMESPACE,
+            PidFdGetNamespace::Ipc => PIDFS_IOCTL_GET_IPC_NAMESPACE,
+            PidFdGetNamespace::Mnt => PIDFS_IOCTL_GET_MNT_NAMESPACE,
+            PidFdGetNamespace::Net => PIDFS_IOCTL_GET_NET_NAMESPACE,
+            PidFdGetNamespace::Pid => PIDFS_IOCTL_GET_PID_NAMESPACE,
+            PidFdGetNamespace::PidForChildren => PIDFS_IOCTL_GET_PID_FOR_CHILDREN_NAMESPACE,
+            PidFdGetNamespace::Time => PIDFS_IOCTL_GET_TIME_NAMESPACE,
+            PidFdGetNamespace::TimeForChildren => PIDFS_IOCTL_GET_TIME_FOR_CHILDREN_NAMESPACE,
+            PidFdGetNamespace::User => PIDFS_IOCTL_GET_USER_NAMESPACE,
+            PidFdGetNamespace::Uts => PIDFS_IOCTL_GET_UTS_NAMESPACE,
         }
     }
 }
 
-pub fn pidfd_get_namespace<Fd: AsFd>(pidfd: &Fd, ns: &PidfdGetNamespace) -> io::Result<OwnedFd> {
+pub fn pidfd_get_namespace<Fd: AsFd>(pidfd: &Fd, ns: &PidFdGetNamespace) -> io::Result<OwnedFd> {
     // SAFETY:
     // The arguments of the ioctl depend on the ioctl number and the fd.
     // The fd wrapped in a Pidfd is always a pidfd fd.
-    // The ioctl number is guarantteed to be as implemented by PidfdGetNamespace::as_ioctl.
+    // The ioctl number is guarantteed to be as implemented by PidFdGetNamespace::as_ioctl.
     // All those ioctl numbers have the same scheme and do not take any other argument.
     // The result is either -1 with errno, or a valid fd.
     unsafe {
@@ -384,20 +372,8 @@ pub fn pidfd_get_ppid<Fd: AsFd>(pidfd: &Fd) -> io::Result<i32> {
 /// Contains the various user and group IDs associated with a process.
 /// Obtained via [`PidFdExt::get_creds`](crate::PidFdExt::get_creds).
 ///
-/// # Examples
-///
-/// ```no_run
-/// use pidfd_util::{PidFd, PidFdExt};
-///
-/// # fn main() -> std::io::Result<()> {
-/// let pidfd = PidFd::from_self()?;
-/// let creds = pidfd.get_creds()?;
-/// println!("Running as UID {} (effective: {})", creds.ruid, creds.euid);
-/// # Ok(())
-/// # }
-/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PidfdCreds {
+pub struct PidFdCreds {
     /// Real user ID
     pub ruid: u32,
     /// Real group ID
@@ -416,8 +392,8 @@ pub struct PidfdCreds {
     pub fsgid: u32,
 }
 
-pub fn pidfd_get_creds<Fd: AsFd>(pidfd: &Fd) -> io::Result<PidfdCreds> {
-    pidfd_get_info(pidfd, PidfdInfoFlags::CREDS).map(|info| PidfdCreds {
+pub fn pidfd_get_creds<Fd: AsFd>(pidfd: &Fd) -> io::Result<PidFdCreds> {
+    pidfd_get_info(pidfd, PidfdInfoFlags::CREDS).map(|info| PidFdCreds {
         ruid: info.ruid,
         rgid: info.rgid,
         euid: info.euid,

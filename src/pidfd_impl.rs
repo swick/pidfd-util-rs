@@ -14,88 +14,28 @@ use std::process::ExitStatus;
 ///
 /// On nightly Rust with the `nightly` feature, this re-exports `std::os::linux::process::PidFd`.
 /// On stable Rust, this provides a compatible implementation.
-///
-/// # Examples
-///
-/// ```no_run
-/// use pidfd_util::{PidFd, PidFdExt};
-/// use std::process::Command;
-///
-/// # fn main() -> std::io::Result<()> {
-/// // Spawn a process
-/// let mut child = Command::new("sleep").arg("10").spawn()?;
-///
-/// // Create a pidfd
-/// let pidfd = PidFd::from_pid(child.id() as i32)?;
-///
-/// // Send SIGKILL and wait for exit
-/// pidfd.kill()?;
-/// let status = pidfd.wait()?;
-/// # Ok(())
-/// # }
-/// ```
 pub struct PidFd(OwnedFd);
 
 impl PidFd {
-    /// Sends `SIGKILL` to the process.
+    /// Sends `SIGKILL` to the process referred to by the pidfd.
     ///
     /// This is a convenience method equivalent to `send_signal(libc::SIGKILL)`.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use pidfd_util::{PidFd, PidFdExt};
-    ///
-    /// # fn main() -> std::io::Result<()> {
-    /// let pidfd = PidFd::from_pid(1234)?;
-    /// pidfd.kill()?;
-    /// # Ok(())
-    /// # }
-    /// ```
     pub fn kill(&self) -> io::Result<()> {
         pidfd_send_signal(self, libc::SIGKILL)
     }
 
-    /// Waits for the process to exit and returns its exit status.
+    /// Waits for the process referred to by the pidfd to exit and returns its exit status.
     ///
     /// This method blocks until the process exits. Use [`try_wait`](Self::try_wait)
     /// for a non-blocking alternative, or [`AsyncPidFd::wait`](crate::AsyncPidFd::wait)
     /// for async code.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use pidfd_util::{PidFd, PidFdExt};
-    ///
-    /// # fn main() -> std::io::Result<()> {
-    /// let pidfd = PidFd::from_pid(1234)?;
-    /// let status = pidfd.wait()?;
-    /// println!("Process exited with: {:?}", status);
-    /// # Ok(())
-    /// # }
-    /// ```
     pub fn wait(&self) -> io::Result<ExitStatus> {
         pidfd_wait(self)
     }
 
-    /// Checks if the process has exited without blocking.
+    /// Checks if the process referred to by the pidfd has exited without blocking.
     ///
     /// Returns `Ok(Some(status))` if the process has exited, `Ok(None)` if it's still running.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use pidfd_util::{PidFd, PidFdExt};
-    ///
-    /// # fn main() -> std::io::Result<()> {
-    /// let pidfd = PidFd::from_pid(1234)?;
-    /// match pidfd.try_wait()? {
-    ///     Some(status) => println!("Process exited: {:?}", status),
-    ///     None => println!("Process still running"),
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
     pub fn try_wait(&self) -> io::Result<Option<ExitStatus>> {
         pidfd_try_wait(self)
     }
