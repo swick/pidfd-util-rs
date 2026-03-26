@@ -1,13 +1,9 @@
 // SPDX-FileCopyrightText: 2026 The pidfd-util-rs authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// TODO:
-// - split out name_to_handle_at into new crate
-
-use std::alloc::{Layout, alloc_zeroed, dealloc};
+use name_to_handle_at::name_to_handle_at;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
 #[cfg(not(feature = "nightly"))]
 use std::os::unix::process::ExitStatusExt;
 #[cfg(not(feature = "nightly"))]
@@ -433,148 +429,6 @@ pub fn pidfd_is_on_pidfs() -> io::Result<bool> {
     }
 }
 
-#[allow(dead_code)]
-pub struct FileHandle {
-    pub mount_id: i32,
-    pub handle_type: i32,
-    pub handle: Vec<u8>,
-}
-
-pub fn name_to_handle_at<Fd: AsFd>(
-    fd: &Fd,
-    path: &std::path::Path,
-    flags: i32,
-) -> io::Result<FileHandle> {
-    #[repr(C)]
-    #[derive(Default)]
-    pub struct __IncompleteArrayField<T>(::std::marker::PhantomData<T>, [T; 0]);
-
-    #[repr(C)]
-    #[derive(Default)]
-    struct file_handle {
-        handle_bytes: libc::c_uint,
-        handle_type: libc::c_int,
-        f_handle: __IncompleteArrayField<libc::c_uchar>,
-    }
-
-    static SUPPORTED: AtomicSupported = AtomicSupported::new(Supported::Unknown);
-
-    let supported = SUPPORTED.load();
-    if supported == Supported::No {
-        return Err(io::ErrorKind::Unsupported.into());
-    }
-
-    let mut handle = file_handle::default();
-    let mut mount_id = 0;
-    let mut path = path.as_os_str().as_bytes().to_owned();
-    path.push(0);
-
-    // SAFETY:
-    // The name_to_handle_at syscall takes arguments which are mirrored here.
-    // The fd wrapped in a Pidfd is always a pidfd fd.
-    // The path is a valid, empty, zero-terminated path.
-    // The handle mirrors `struct file_handle` and is zero-initialized, this means file_handle.handle_bytes is also zero, so the allocated size for handle is correct.
-    // The mount_id is a valid pointer to an int.
-    // The syscall handles arbitrary values of flags.
-    #[allow(clippy::unnecessary_cast)]
-    let err = cvt(unsafe {
-        libc::syscall(
-            libc::SYS_name_to_handle_at,
-            fd.as_fd().as_raw_fd() as libc::c_int,
-            path.as_ptr() as *const libc::c_char,
-            &raw mut handle as *mut file_handle,
-            &raw mut mount_id as *mut libc::c_int,
-            flags,
-        ) as libc::c_int
-    })
-    .unwrap_err();
-
-    if err.raw_os_error().unwrap() == libc::EOPNOTSUPP {
-        SUPPORTED.store(Supported::No);
-    } else if supported == Supported::Unknown {
-        SUPPORTED.store(Supported::Yes);
-    }
-
-    if err.raw_os_error().unwrap() != libc::EOVERFLOW || handle.handle_bytes == 0 {
-        return Err(err);
-    }
-
-    loop {
-        let layout = Layout::new::<file_handle>();
-        let buf_layout =
-            Layout::array::<libc::c_uchar>(handle.handle_bytes.try_into().unwrap()).unwrap();
-        let (layout, buf_offset) = layout.extend(buf_layout).unwrap();
-        let layout = layout.pad_to_align();
-
-        // SAFETY:
-        // Layout has non-zero size because file_handle has non-zero size
-        let buf = unsafe { alloc_zeroed(layout) };
-        // SAFETY:
-        // Constructing a Box from the newly allocated, zeroed memory is valid
-        let mut new_handle: Box<file_handle> = unsafe { Box::from_raw(buf as _) };
-        new_handle.handle_bytes = handle.handle_bytes;
-        new_handle.handle_type = handle.handle_type;
-
-        // SAFETY:
-        // Same as the previous name_to_handle_at syscall, except...
-        // new_handle.handle_bytes is bigger than zero, so the memory allocated for new_handle must be bigger by that amount.
-        // The code above ensures we allocated the right size.
-        #[allow(clippy::unnecessary_cast)]
-        let res = cvt(unsafe {
-            libc::syscall(
-                libc::SYS_name_to_handle_at,
-                fd.as_fd().as_raw_fd() as libc::c_int,
-                path.as_ptr() as *const libc::c_char,
-                &raw mut *new_handle as *mut file_handle,
-                &raw mut mount_id as *mut libc::c_int,
-                flags,
-            ) as libc::c_int
-        });
-
-        handle.handle_bytes = new_handle.handle_bytes;
-        handle.handle_type = new_handle.handle_type;
-        // We leak this because the memory belongs to buf
-        Box::leak(new_handle);
-
-        match res {
-            Err(e) if e.raw_os_error().unwrap() == libc::EOVERFLOW => (),
-            Err(e) => {
-                // SAFETY:
-                // buf and layout are still valid, and we must deallocate the memory to avoid memory leaks
-                unsafe { dealloc(buf, layout) };
-                return Err(e);
-            }
-            Ok(_) => {
-                let h = {
-                    // SAFETY:
-                    // buf_offset was created from the layout to point at the char[].
-                    // We allocated enough size for handle_bytes via the layout.
-                    // The [u8] is thus properly aligned and non-zero.
-                    // f_handle goes out of scope before we deallocate.
-                    let f_handle = unsafe {
-                        std::slice::from_raw_parts(
-                            buf.offset(buf_offset.try_into().unwrap()),
-                            handle.handle_bytes.try_into().unwrap(),
-                        )
-                    };
-
-                    FileHandle {
-                        mount_id,
-                        handle_type: handle.handle_type,
-                        handle: f_handle.to_vec(),
-                    }
-                };
-
-                // SAFETY:
-                // buf and layout are still valid, and we must deallocate the memory to avoid memory leaks
-                unsafe { dealloc(buf, layout) };
-
-                return Ok(h);
-            }
-        }
-    }
-}
-
 pub fn pidfd_get_inode_id<Fd: AsFd>(pidfd: &Fd) -> io::Result<u64> {
     use nix::sys::stat::fstat;
 
@@ -589,7 +443,7 @@ pub fn pidfd_get_inode_id<Fd: AsFd>(pidfd: &Fd) -> io::Result<u64> {
     ) {
         Err(e) if e.kind() == io::ErrorKind::Unsupported => (),
         Err(e) => return Err(e),
-        Ok(h) => return Ok(u64::from_ne_bytes(h.handle.try_into().unwrap())),
+        Ok((h, _)) => return Ok(u64::from_ne_bytes(h.handle.try_into().unwrap())),
     }
 
     let stat = fstat(pidfd)?;

@@ -29,6 +29,7 @@ nix = { version = ">=0.30,<0.32", features = [
     "fs",
     "sched",
 ] }
+name-to-handle-at = { version = "0.1", git = "https://github.com/swick/name-to-handle-at-rs.git" }
 
 [dev-dependencies]
 futures-lite = "2.0"

@@ -121,6 +121,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
+name = "name-to-handle-at"
+version = "0.1.0"
+source = "git+https://github.com/swick/name-to-handle-at-rs.git#b0ac90289398ed1891d8f7ed3fd28b05b63dd504"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "nix"
 version = "0.31.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -145,6 +153,7 @@ dependencies = [
  "async-io",
  "futures-lite",
  "libc",
+ "name-to-handle-at",
  "nix",
 ]
 
